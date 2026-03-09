@@ -1,13 +1,13 @@
 # here are the dependencies for this project
 # feel free to add more/use different versions as needed
 
-langchain-core~=0.3.68
-langchain-openai~=0.3.27
-python-dotenv~=1.1.1
-langchain-community~=0.3.27
-langfuse~=3.0.2
-qdrant-client~=1.14.3
+langchain-core
+langchain-openai
+python-dotenv
+langchain-community
+langfuse
+qdrant-client
 langchain_qdrant
 requests
-langchain~=0.3.26
-nemoguardrails~=0.14.1
+langchain
+nemoguardrails
