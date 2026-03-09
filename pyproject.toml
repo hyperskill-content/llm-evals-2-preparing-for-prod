@@ -1,0 +1,18 @@
+[project]
+name = "llm-evals-2-preparing-for-prod"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=1.2.10",
+    "langchain-community>=0.4.1",
+    "langchain-core>=1.2.18",
+    "langchain-openai>=1.1.10",
+    "langchain-qdrant>=1.1.0",
+    "langfuse>=3.14.5",
+    "nemoguardrails>=0.20.0",
+    "python-dotenv>=1.2.2",
+    "qdrant-client>=1.17.0",
+    "requests>=2.32.5",
+]
