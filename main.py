@@ -15,6 +15,10 @@ from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
 from langchain_core.runnables import RunnableConfig
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_redis import RedisChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import trim_messages
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -41,13 +45,18 @@ langfuse_handler = CallbackHandler()
 lf = get_client()
 # Initialize conversation history
 conversation = []
+REDIS_URL = "redis://localhost:6380/0"
+chat_history = RedisChatMessageHistory(session_id="hyper", redis_url=REDIS_URL)
 
+def get_redis_history(session_id: str) -> BaseChatMessageHistory:
+    return RedisChatMessageHistory(session_id, redis_url=REDIS_URL)
 
 def get_config(run_name: str, metadata: dict) -> RunnableConfig:
     # "goodbye" ["config", "goodbye"]
     config: RunnableConfig = {
         "run_name": run_name,
         "callbacks": [langfuse_handler],
+        "configurable": {"session_id": session_name},
         "metadata": {
             "langfuse_session_id": session_name,
             "langfuse_user_id": user_id,
@@ -176,6 +185,15 @@ def smartphone_info_tool(model: str) -> str:
     except Exception as e:
         return f"Error during smartphone information retrieval for model {model}: {e}"
 
+def get_trimmer():
+    return trim_messages(
+        strategy="last",  # keep either the last or first messages
+        token_counter=llm,  # use your LLM to count tokens or create a special function
+        max_tokens=500,  # the maximum number of tokens
+        start_on="human",  # the first message type in the trimmed history
+        end_on=("human", "tool"),  # the last message type in the trimmed history
+        include_system=True,  # always include the system message
+    )
 
 # ---------------------------
 # Tool Call Handling and Response Generation
@@ -237,22 +255,27 @@ def main():
     context_prompt = ChatPromptTemplate.from_messages(
         lf_prompt_context.get_langchain_prompt()
     )
+    context_prompt.metadata = {"langfuse_prompt": lf_prompt_context}
     review_prompt = ChatPromptTemplate.from_messages(
         lf_prompt_review.get_langchain_prompt()
     )
+    review_prompt.metadata = {"langfuse_prompt": lf_prompt_review}
     goodbye_prompt = PromptTemplate.from_template(
         lf_prompt_goodbye.get_langchain_prompt(),
         metadata = {"langfuse_prompt": lf_prompt_goodbye}
     )
-
-    context_prompt.metadata = {"langfuse_prompt": lf_prompt_context}
-    review_prompt.metadata = {"langfuse_prompt": lf_prompt_review}
-    # goodbye_prompt.metadata = {"langfuse_prompt": lf_prompt_goodbye}
-
-    context_chain = context_prompt | llm_with_tools | generate_context
-    review_chain = review_prompt | llm
-
+    trimmer = get_trimmer()
+    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
+    review_chain = review_prompt |trimmer | llm
     goodbye_chain = goodbye_prompt | llm
+    chain_context_with_message_history = RunnableWithMessageHistory(
+        context_chain, get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
+    )
+
+    chain_review_with_message_history = RunnableWithMessageHistory(
+        review_chain, get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
+    )
+
     update_trace("main-trace")
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
@@ -284,19 +307,18 @@ def main():
 
             conversation.append(HumanMessage(user_input))
 
-            context_chain.invoke(
+            chain_context_with_message_history.invoke(
                 {"user_input": user_input, "conversation": conversation},
                 get_config("context", {"context": "invoke"})
             )
 
-            response = review_chain.invoke(
+            response = chain_review_with_message_history.invoke(
                 {"user_id": user_id, "user_input": user_input, "conversation": conversation},
                 get_config("review", {"review": "invoke"})
             )
 
             print(f"System: {response.content}")
             conversation.append(response)
-
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
