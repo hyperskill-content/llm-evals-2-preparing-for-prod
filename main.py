@@ -1,1 +1,283 @@
-# start where you left off in part one of this series
+import json
+import os
+import sys
+import uuid
+
+import dotenv
+from langchain_community.docstore.document import Document
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
+from langfuse.langchain import CallbackHandler
+from langfuse import observe, get_client, propagate_attributes, Langfuse
+
+dotenv.load_dotenv()
+
+users = ["James", "George", "Mike", "Sherlock"]
+user_id = users[uuid.uuid4().int % len(users)]
+
+llm = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+embeddings_model = OpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    show_progress_bar=True,
+)
+
+conversation = []
+
+
+@observe(name="embed-documents")
+def embed_documents(json_path: str):
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: The file {json_path} was not found.")
+        return []
+    except json.JSONDecodeError as jde:
+        print(f"Error decoding JSON from file {json_path}: {jde}")
+        return []
+    except Exception as e:
+        print(f"An unexpected error occurred while reading {json_path}: {e}")
+        return []
+
+    documents = []
+    for entry in data:
+        content = (
+            f"Model: {entry.get('model', '')}\n"
+            f"Price: {entry.get('price', '')}\n"
+            f"Rating: {entry.get('rating', '')}\n"
+            f"SIM: {entry.get('sim', '')}\n"
+            f"Processor: {entry.get('processor', '')}\n"
+            f"RAM: {entry.get('ram', '')}\n"
+            f"Battery: {entry.get('battery', '')}\n"
+            f"Display: {entry.get('display', '')}\n"
+            f"Camera: {entry.get('camera', '')}\n"
+            f"Card: {entry.get('card', '')}\n"
+            f"OS: {entry.get('os', '')}\n"
+            f"In Stock: {entry.get('in_stock', '')}"
+        )
+        documents.append(Document(page_content=content))
+
+    try:
+        collection_name = "smartphones"
+        qdrant_client = QdrantClient("http://localhost:6333")
+
+        collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
+        if not collection_exists:
+            qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(
+                    size=1536,
+                    distance=Distance.COSINE,
+                ),
+            )
+
+            qdrant_store = QdrantVectorStore(
+                client=qdrant_client,
+                collection_name=collection_name,
+                embedding=embeddings_model
+            )
+
+            qdrant_store.add_documents(documents=documents)
+
+            return qdrant_store
+
+        else:
+            qdrant_store = QdrantVectorStore.from_existing_collection(
+                embedding=embeddings_model,
+                collection_name=collection_name,
+            )
+
+            return qdrant_store
+
+    except Exception as e:
+        print(f"Error initializing the vector store: {e}")
+        return []
+
+
+@tool("SmartphoneInfo")
+def smartphone_info_tool(model: str) -> str:
+    """Retrieves information about a smartphone model from the product database."""
+    product_db = embed_documents("datasets/smartphones.json")
+    try:
+        results = product_db.similarity_search(model, k=1)
+        if not results:
+            print(f"Info: No results found for model: {model}")
+            return "Could not find information for the specified model."
+        info = results[0].page_content
+        return info
+    except Exception as e:
+        return f"Error during smartphone information retrieval for model {model}: {e}"
+
+
+@observe(name="generate-context")
+def generate_context(ai_message: AIMessage) -> dict:
+    conversation.append(ai_message)
+
+    if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
+        conversation.append(
+            AIMessage(
+                content="No tool calls found. Please ensure the model is configured to use tools."
+            )
+        )
+        return {"tool_responses": []}
+
+    tool_responses = []
+    available_tools = {"SmartphoneInfo": smartphone_info_tool}
+
+    for tool_call in ai_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        selected_tool = available_tools.get(tool_name)
+        if selected_tool:
+            try:
+                result = selected_tool.invoke(tool_args)
+                tool_msg = ToolMessage(content=result, tool_call_id=tool_call["id"])
+                conversation.append(tool_msg)
+                tool_responses.append(tool_msg)
+            except Exception as e:
+                error_msg = ToolMessage(
+                    content=f"Error executing tool {tool_name}: {e}",
+                    tool_call_id=tool_call["id"],
+                )
+                conversation.append(error_msg)
+                tool_responses.append(error_msg)
+        else:
+            not_found_msg = ToolMessage(
+                content=f"Tool {tool_name} not found.",
+                tool_call_id=tool_call["id"],
+            )
+            conversation.append(not_found_msg)
+            tool_responses.append(not_found_msg)
+
+    return {"tool_responses": tool_responses}
+
+
+# noinspection PyTypeChecker
+@observe(name="main")
+def main():
+    global conversation
+
+    session_name = f"session-{uuid.uuid4().hex[:8]}"
+    langfuse_client = get_client()
+
+    with propagate_attributes(
+        trace_name="ai-response",
+        session_id=session_name,
+        user_id=user_id,
+    ):
+        langfuse_handler = CallbackHandler()
+
+        tools = [smartphone_info_tool]
+        llm_with_tools = llm.bind_tools(tools)
+
+        langfuse_prompts = Langfuse()
+
+        context_langfuse_prompt = langfuse_prompts.get_prompt("context-prompt")
+        review_langfuse_prompt = langfuse_prompts.get_prompt("review-prompt")
+        goodbye_langfuse_prompt = langfuse_prompts.get_prompt("goodbye-prompt")
+
+        context_prompt = ChatPromptTemplate.from_messages(
+            [
+                context_langfuse_prompt.get_langchain_prompt()[0],
+                MessagesPlaceholder(variable_name="conversation"),
+                context_langfuse_prompt.get_langchain_prompt()[1],
+            ]
+        )
+        context_prompt.metadata = {"langfuse_prompt": context_langfuse_prompt}
+
+        review_prompt = ChatPromptTemplate.from_messages(
+            [
+                review_langfuse_prompt.get_langchain_prompt()[0],
+                MessagesPlaceholder(variable_name="conversation"),
+                review_langfuse_prompt.get_langchain_prompt()[1],
+            ]
+        )
+        review_prompt.metadata = {"langfuse_prompt": review_langfuse_prompt}
+
+        goodbye_prompt = ChatPromptTemplate.from_messages(
+            [goodbye_langfuse_prompt.get_langchain_prompt()[0]]
+        )
+        goodbye_prompt.metadata = {"langfuse_prompt": goodbye_langfuse_prompt}
+
+        context_chain = context_prompt | llm_with_tools | generate_context
+        review_chain = review_prompt | llm
+        goodbye_chain = goodbye_prompt | llm
+
+        try:
+            print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
+            while True:
+                user_input = input("User: ").strip()
+                if user_input.lower() in ["exit", "quit", "bye", "end"]:
+                    feedback = input("Was this answer helpful? (Yes/No): ")
+                    user_comment = input("Please give us a reason for your answer. This will help us improve: ")
+
+                    langfuse_client.score_current_trace(
+                        name="usefulness",
+                        value=feedback,
+                        data_type="CATEGORICAL",
+                        comment=user_comment,
+                    )
+
+                    goodbye_message = goodbye_chain.invoke(
+                        {"user_id": user_id},
+                        config={
+                            "run_name": "goodbye-message",
+                            "callbacks": [langfuse_handler],
+                            "metadata": {
+                                "langfuse_user_id": user_id,
+                                "langfuse_session_id": session_name,
+                            },
+                        },
+                    )
+                    print(f"System: {goodbye_message.content}")
+                    break
+
+                conversation.append(HumanMessage(user_input))
+
+                context_chain.invoke(
+                    {"user_input": user_input, "conversation": conversation},
+                    config={
+                        "run_name": "context",
+                        "callbacks": [langfuse_handler],
+                        "metadata": {
+                            "langfuse_user_id": user_id,
+                            "langfuse_session_id": session_name,
+                        },
+                    },
+                )
+
+                response = review_chain.invoke(
+                    {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                    config={
+                        "run_name": "final-response",
+                        "callbacks": [langfuse_handler],
+                        "metadata": {
+                            "langfuse_user_id": user_id,
+                            "langfuse_session_id": session_name,
+                        },
+                    },
+                )
+
+                print(f"System: {response.content}")
+                conversation.append(response)
+
+        except Exception as e:
+            print(f"An unexpected error occurred in the main loop: {e}")
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
