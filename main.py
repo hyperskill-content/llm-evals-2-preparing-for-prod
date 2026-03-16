@@ -11,6 +11,8 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse.langchain import CallbackHandler
@@ -195,6 +197,9 @@ def main():
         include_system=True,
     )
 
+    rails_config = RailsConfig.from_path("config")
+    rails = RunnableRails(rails_config, input_key="user_input")
+
     with propagate_attributes(
         trace_name="ai-response",
         session_id=session_name,
@@ -266,6 +271,11 @@ def main():
                     )
                     print(f"System: {goodbye_message.content}")
                     break
+
+                rail_result = rails.invoke({"user_input": user_input})
+                if isinstance(rail_result, dict) and "I'm sorry, I can't respond to that" in rail_result.get("output",""):
+                    print(f"System: {rail_result['output']}")
+                    continue
 
                 chat_history.add_message(HumanMessage(content=user_input))
 

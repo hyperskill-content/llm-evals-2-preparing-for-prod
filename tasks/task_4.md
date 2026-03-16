@@ -71,8 +71,8 @@ With the `config.yaml` file in place, we also need to slightly modify the `docke
 
 ```yaml
 volumes:
-  - ./config.yaml:/app/config.yaml
-command: [ "--config", "/app/config.yaml", "--port", "4000"]
+  - ./config.yml:/app/config.yml
+command: [ "--config", "/app/config.yml", "--port", "4000"]
 ```
 
 Ensure that you create and map the file as *config.yaml,* not *config.yml*. Also, if the PostgreSQL or Prometheus ports are already in use, you need to map them to different host ports. (For example, port `5432` for PostgreSQL is already being used by Langfuse. The syntax is `*host port:container port`.*)
