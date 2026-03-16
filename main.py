@@ -5,17 +5,20 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse.langchain import CallbackHandler
 from langfuse import observe, get_client, propagate_attributes, Langfuse
 
 dotenv.load_dotenv()
+
+REDIS_URL = "redis://localhost:6380/0"
 
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
@@ -33,7 +36,15 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-conversation = []
+chat_history = None
+
+
+def get_clean_messages():
+    return [
+        msg for msg in chat_history.messages
+        if not isinstance(msg, ToolMessage)
+        and not (isinstance(msg, AIMessage) and msg.tool_calls)
+    ]
 
 
 @observe(name="embed-documents")
@@ -123,10 +134,10 @@ def smartphone_info_tool(model: str) -> str:
 
 @observe(name="generate-context")
 def generate_context(ai_message: AIMessage) -> dict:
-    conversation.append(ai_message)
+    chat_history.add_message(ai_message)
 
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
+        chat_history.add_message(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
@@ -145,21 +156,21 @@ def generate_context(ai_message: AIMessage) -> dict:
             try:
                 result = selected_tool.invoke(tool_args)
                 tool_msg = ToolMessage(content=result, tool_call_id=tool_call["id"])
-                conversation.append(tool_msg)
+                chat_history.add_message(tool_msg)
                 tool_responses.append(tool_msg)
             except Exception as e:
                 error_msg = ToolMessage(
                     content=f"Error executing tool {tool_name}: {e}",
                     tool_call_id=tool_call["id"],
                 )
-                conversation.append(error_msg)
+                chat_history.add_message(error_msg)
                 tool_responses.append(error_msg)
         else:
             not_found_msg = ToolMessage(
                 content=f"Tool {tool_name} not found.",
                 tool_call_id=tool_call["id"],
             )
-            conversation.append(not_found_msg)
+            chat_history.add_message(not_found_msg)
             tool_responses.append(not_found_msg)
 
     return {"tool_responses": tool_responses}
@@ -168,10 +179,21 @@ def generate_context(ai_message: AIMessage) -> dict:
 # noinspection PyTypeChecker
 @observe(name="main")
 def main():
-    global conversation
+    global chat_history
 
     session_name = f"session-{uuid.uuid4().hex[:8]}"
     langfuse_client = get_client()
+
+    chat_history = RedisChatMessageHistory(session_id=session_name, redis_url=REDIS_URL, ttl=300)
+
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=llm,
+        max_tokens=500,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
+    )
 
     with propagate_attributes(
         trace_name="ai-response",
@@ -208,7 +230,7 @@ def main():
         review_prompt.metadata = {"langfuse_prompt": review_langfuse_prompt}
 
         goodbye_prompt = ChatPromptTemplate.from_messages(
-            [goodbye_langfuse_prompt.get_langchain_prompt()[0]]
+            goodbye_langfuse_prompt.get_langchain_prompt()
         )
         goodbye_prompt.metadata = {"langfuse_prompt": goodbye_langfuse_prompt}
 
@@ -245,10 +267,12 @@ def main():
                     print(f"System: {goodbye_message.content}")
                     break
 
-                conversation.append(HumanMessage(user_input))
+                chat_history.add_message(HumanMessage(content=user_input))
+
+                trimmed_messages = trimmer.invoke(get_clean_messages())
 
                 context_chain.invoke(
-                    {"user_input": user_input, "conversation": conversation},
+                    {"user_input": user_input, "conversation": trimmed_messages},
                     config={
                         "run_name": "context",
                         "callbacks": [langfuse_handler],
@@ -260,7 +284,7 @@ def main():
                 )
 
                 response = review_chain.invoke(
-                    {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                    {"user_id": user_id, "user_input": user_input, "conversation": get_clean_messages()},
                     config={
                         "run_name": "final-response",
                         "callbacks": [langfuse_handler],
@@ -272,7 +296,7 @@ def main():
                 )
 
                 print(f"System: {response.content}")
-                conversation.append(response)
+                chat_history.add_message(response)
 
         except Exception as e:
             print(f"An unexpected error occurred in the main loop: {e}")
