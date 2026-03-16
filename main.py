@@ -25,18 +25,17 @@ users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 session_name = f"session-{uuid.uuid4().hex[:8]}"
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": user_id},
 )
 
-# Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True,
 )
 
