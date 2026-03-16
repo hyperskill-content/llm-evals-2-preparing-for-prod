@@ -10,9 +10,11 @@ dependencies = [
     "langchain-core>=1.2.18",
     "langchain-openai>=1.1.10",
     "langchain-qdrant>=1.1.0",
+    "langchain-redis>=0.2.5",
     "langfuse>=3.14.5",
     "nemoguardrails>=0.20.0",
     "python-dotenv>=1.2.2",
     "qdrant-client>=1.17.0",
+    "redis>=7.3.0",
     "requests>=2.32.5",
 ]

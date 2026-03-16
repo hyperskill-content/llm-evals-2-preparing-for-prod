@@ -5,11 +5,12 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, get_client
@@ -37,8 +38,18 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-# Initialize conversation history
-conversation = []
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING", "redis://localhost:6380/0")
+chat_history = RedisChatMessageHistory(session_id=session_name, redis_url=REDIS_URL, ttl=3600)
+
+
+trimmer = trim_messages(
+    strategy="last",
+    token_counter=llm,
+    max_tokens=500,
+    start_on="human",
+    end_on=("human", "tool"),
+    include_system=True,
+)
 
 
 # ---------------------------
@@ -180,11 +191,11 @@ def generate_context(ai_message: AIMessage) -> dict:
     )
 
     # construct the conversation history with the AI message containing tool calls
-    conversation.append(ai_message)
+    chat_history.add_message(ai_message)
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
+        chat_history.add_message(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
@@ -196,11 +207,11 @@ def generate_context(ai_message: AIMessage) -> dict:
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
+                chat_history.add_message(tool_output)
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
+        chat_history.add_message(
             AIMessage(
                 content=f"An error occurred while processing tool calls: {e}"
             )
@@ -301,10 +312,12 @@ def main():
                 print(f"System: {goodbye_message.content}")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            chat_history.add_message(HumanMessage(content=user_input))
+
+            trimmed_conversation = trimmer.invoke(chat_history.messages)
 
             context_chain.invoke(
-                {"user_input": user_input, "conversation": conversation},
+                {"user_input": user_input, "conversation": trimmed_conversation},
                 config={
                     "run_name": "context",
                     "callbacks": [langfuse_handler],
@@ -316,7 +329,7 @@ def main():
             )
 
             response = review_chain.invoke(
-                {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                {"user_id": user_id, "user_input": user_input, "conversation": chat_history.messages},
                 config={
                     "run_name": "final-response",
                     "callbacks": [langfuse_handler],
@@ -328,7 +341,7 @@ def main():
             )
 
             print(f"System: {response.content}")
-            conversation.append(response)
+            chat_history.add_message(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
