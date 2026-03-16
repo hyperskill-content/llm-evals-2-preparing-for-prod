@@ -26,15 +26,16 @@ users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url="http://localhost:4000/",
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "HyperUser"},
 )
 
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url="http://localhost:4000/",
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True,
 )
 
@@ -273,7 +274,7 @@ def main():
                     break
 
                 rail_result = rails.invoke({"user_input": user_input})
-                if isinstance(rail_result, dict) and "I'm sorry, I can't respond to that" in rail_result.get("output",""):
+                if isinstance(rail_result, dict) and "I'm sorry, I can't respond to that" in rail_result.get("output", ""):
                     print(f"System: {rail_result['output']}")
                     continue
 
