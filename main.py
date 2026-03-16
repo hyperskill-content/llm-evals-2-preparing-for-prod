@@ -15,6 +15,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -256,6 +258,9 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
+    rails_config = RailsConfig.from_path("config")
+    rails = RunnableRails(rails_config, input_key="user_input")
+
     context_chain = context_prompt | llm_with_tools | generate_context
     review_chain = review_prompt | llm
 
@@ -313,6 +318,12 @@ def main():
                 break
 
             chat_history.add_message(HumanMessage(content=user_input))
+
+            guard_result = rails.invoke({"user_input": user_input})
+            if guard_result.get("output", "").strip() == "I'm sorry, I can't respond to that.":
+                print(f"System: {guard_result['output']}")
+                chat_history.add_message(AIMessage(content=guard_result["output"]))
+                continue
 
             trimmed_conversation = trimmer.invoke(chat_history.messages)
 
