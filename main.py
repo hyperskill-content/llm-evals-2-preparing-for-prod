@@ -43,11 +43,19 @@ llm_rails = LLMRails(config)
 
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
+# llm = ChatOpenAI(
+#     model=os.getenv("OPENAI_MODEL"),
+#     base_url=os.getenv("OPENAI_BASE_URL"),
+#     api_key=os.getenv("OPENAI_API_KEY")
+# )
+# new llm configuration
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url="http://127.0.0.1:4000",
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "HyperUser"},
 )
+
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
@@ -326,7 +334,7 @@ def main():
                     continue
 
             # if user input is not (exit, bye, etc)
-            conversation.append(HumanMessage(user_input))
+            conversation.append(HumanMessage(content=user_input))
 
             context_chain.invoke(
                 {"user_input": user_input, "conversation": conversation},
