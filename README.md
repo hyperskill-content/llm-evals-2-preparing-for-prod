@@ -1,3 +1,30 @@
+## How to run
+
+1. Install `uv` if you haven't.
+  
+  ```sh
+  # macOS/Linux
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  
+  # Windows
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+  
+  # Or via pip
+  pip install uv
+  ```
+
+2. Sync the project environment
+
+```sh
+uv sync
+```
+
+3. Run the code
+
+```sh
+uv run main.py 
+```
+
 ## Table of Contents
 
 - [Introduction](#introduction)
