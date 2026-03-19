@@ -19,7 +19,10 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_redis import RedisChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.messages import trim_messages
-
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from langchain_core.globals import set_debug
+set_debug(False)
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
@@ -47,6 +50,9 @@ lf = get_client()
 conversation = []
 REDIS_URL = "redis://localhost:6380/0"
 chat_history = RedisChatMessageHistory(session_id="hyper", redis_url=REDIS_URL)
+
+rails_config = RailsConfig.from_path("rails")
+rails = RunnableRails(rails_config, input_key="user_input")
 
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(session_id, redis_url=REDIS_URL)
@@ -304,6 +310,11 @@ def main():
 
                 print(f"System: {goodbye_message.content}")
                 break
+
+            rail_result = rails.invoke({"user_input": user_input})
+            if "I'm sorry, I can't respond to that" in rail_result.get("output"):
+                print(f"System: {rail_result.get('output')}")
+                continue
 
             conversation.append(HumanMessage(user_input))
 
