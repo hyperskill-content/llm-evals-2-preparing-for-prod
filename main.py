@@ -247,7 +247,7 @@ def main():
     review_prompt.metadata = {"langfuse_prompt": review_system_prompt}
 
     goodbye_prompt = PromptTemplate.from_template(
-        goodbye_system_prompt.get_langchain_prompt()
+        goodbye_system_prompt.get_langchain_prompt()[0][1]
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
