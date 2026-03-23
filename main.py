@@ -232,7 +232,7 @@ def main():
 
     lf_prompt_context = lf.get_prompt(name="smartphone/context", label="latest")
     lf_prompt_review = lf.get_prompt(name="smartphone/review", label="latest")
-    lf_prompt_goodbye = lf.get_prompt(name="smartphone/goodbye1", label="latest")
+    lf_prompt_goodbye = lf.get_prompt(name="smartphone/goodbye", label="latest")
 
     context_prompt = ChatPromptTemplate.from_messages(
         lf_prompt_context.get_langchain_prompt()
@@ -240,14 +240,13 @@ def main():
     review_prompt = ChatPromptTemplate.from_messages(
         lf_prompt_review.get_langchain_prompt()
     )
-    goodbye_prompt = PromptTemplate.from_template(
+    goodbye_prompt = ChatPromptTemplate.from_template(
         lf_prompt_goodbye.get_langchain_prompt(),
-        metadata = {"langfuse_prompt": lf_prompt_goodbye}
     )
 
     context_prompt.metadata = {"langfuse_prompt": lf_prompt_context}
     review_prompt.metadata = {"langfuse_prompt": lf_prompt_review}
-    # goodbye_prompt.metadata = {"langfuse_prompt": lf_prompt_goodbye}
+    goodbye_prompt.metadata = {"langfuse_prompt": lf_prompt_goodbye}
 
     context_chain = context_prompt | llm_with_tools | generate_context
     review_chain = review_prompt | llm
