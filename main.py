@@ -2,7 +2,6 @@ import json
 import os
 import sys
 import uuid
-
 import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
@@ -19,11 +18,12 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_redis import RedisChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.messages import trim_messages
+from langchain_core.runnables import RunnableLambda
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
-session_name = f"session-{uuid.uuid4().hex[:8]}"
+session_id = f"session-{uuid.uuid4().hex[:8]}"
 user_id = f"user-{uuid.uuid4().hex[:8]}"
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
@@ -46,19 +46,26 @@ lf = get_client()
 # Initialize conversation history
 conversation = []
 REDIS_URL = "redis://localhost:6380/0"
-chat_history = RedisChatMessageHistory(session_id="hyper", redis_url=REDIS_URL)
+chat_history = RedisChatMessageHistory(session_id=session_id, redis_url=REDIS_URL)
 
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
-    return RedisChatMessageHistory(session_id, redis_url=REDIS_URL)
+    return RedisChatMessageHistory(session_id = session_id, redis_url=REDIS_URL, ttl=120)
+
+def get_clean_messages():
+    return [
+        msg for msg in chat_history.messages
+        if not isinstance(msg, ToolMessage)
+        and not (isinstance(msg, AIMessage) and msg.tool_calls)
+    ]
 
 def get_config(run_name: str, metadata: dict) -> RunnableConfig:
     # "goodbye" ["config", "goodbye"]
     config: RunnableConfig = {
         "run_name": run_name,
         "callbacks": [langfuse_handler],
-        "configurable": {"session_id": session_name},
+        "configurable": {"session_id": session_id},
         "metadata": {
-            "langfuse_session_id": session_name,
+            "langfuse_session_id": session_id,
             "langfuse_user_id": user_id,
             "langfuse_tags": metadata
         },
@@ -69,7 +76,7 @@ def get_config(run_name: str, metadata: dict) -> RunnableConfig:
 def update_trace(run_name: str):
     lf.update_current_trace(
         name=run_name,
-        session_id=session_name,
+        session_id=session_id,
         user_id=user_id,
     )
 
@@ -199,7 +206,7 @@ def get_trimmer():
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context-observer")
-def generate_context(ai_message: AIMessage) -> dict|None:
+def generate_context(ai_message: AIMessage):
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
 
@@ -210,31 +217,46 @@ def generate_context(ai_message: AIMessage) -> dict|None:
         A dictionary containing a list of ToolMessage objects under the key "tool_responses".
     """
     # construct the conversation history with the AI message containing tool calls
-    conversation.append(ai_message)
-    update_trace("generate_context-trace")
-    # Check if the AI message has any tool calls
+    chat_history.add_message(ai_message)
+
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
+        chat_history.add_message(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
         )
+        return {"tool_responses": []}
 
-    try:
-        # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-        # a message with tool calls is expected to be followed by tool responses
-        for tool_call in ai_message.tool_calls:
-            if tool_call["name"] == "SmartphoneInfo":
-                tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
+    tool_responses = []
+    available_tools = {"SmartphoneInfo": smartphone_info_tool}
 
-    except Exception as e:
-        print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
-            AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
+    for tool_call in ai_message.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+
+        selected_tool = available_tools.get(tool_name)
+        if selected_tool:
+            try:
+                result = selected_tool.invoke(tool_args)
+                tool_msg = ToolMessage(content=result, tool_call_id=tool_call["id"])
+                chat_history.add_message(tool_msg)
+                tool_responses.append(tool_msg)
+            except Exception as e:
+                error_msg = ToolMessage(
+                    content=f"Error executing tool {tool_name}: {e}",
+                    tool_call_id=tool_call["id"],
+                )
+                chat_history.add_message(error_msg)
+                tool_responses.append(error_msg)
+        else:
+            not_found_msg = ToolMessage(
+                content=f"Tool {tool_name} not found.",
+                tool_call_id=tool_call["id"],
             )
-        )
+            chat_history.add_message(not_found_msg)
+            tool_responses.append(not_found_msg)
+
+    return {"tool_responses": tool_responses}
 
 
 # ---------------------------
@@ -250,31 +272,42 @@ def main():
 
     lf_prompt_context = lf.get_prompt(name="smartphone/context", label="latest")
     lf_prompt_review = lf.get_prompt(name="smartphone/review", label="latest")
-    lf_prompt_goodbye = lf.get_prompt(name="smartphone/goodbye1", label="latest")
+    lf_prompt_goodbye = lf.get_prompt(name="smartphone/goodbye", label="latest")
 
     context_prompt = ChatPromptTemplate.from_messages(
-        lf_prompt_context.get_langchain_prompt()
+        [
+            lf_prompt_context.get_langchain_prompt()[0],
+            MessagesPlaceholder(variable_name="conversation"),
+            lf_prompt_context.get_langchain_prompt()[1],
+        ]
     )
-    context_prompt.metadata = {"langfuse_prompt": lf_prompt_context}
     review_prompt = ChatPromptTemplate.from_messages(
-        lf_prompt_review.get_langchain_prompt()
+        [
+            lf_prompt_review.get_langchain_prompt()[0],
+            MessagesPlaceholder(variable_name="conversation"),
+            lf_prompt_review.get_langchain_prompt()[1],
+        ]
     )
-    review_prompt.metadata = {"langfuse_prompt": lf_prompt_review}
-    goodbye_prompt = PromptTemplate.from_template(
-        lf_prompt_goodbye.get_langchain_prompt(),
-        metadata = {"langfuse_prompt": lf_prompt_goodbye}
-    )
-    trimmer = get_trimmer()
-    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
-    review_chain = review_prompt |trimmer | llm
-    goodbye_chain = goodbye_prompt | llm
-    chain_context_with_message_history = RunnableWithMessageHistory(
-        context_chain, get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
+    goodbye_prompt = ChatPromptTemplate.from_messages(
+        lf_prompt_goodbye.get_langchain_prompt()
     )
 
-    chain_review_with_message_history = RunnableWithMessageHistory(
-        review_chain, get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
-    )
+    review_prompt.metadata = {"langfuse_prompt": lf_prompt_review}
+    context_prompt.metadata = {"langfuse_prompt": lf_prompt_context}
+    goodbye_prompt.metadata = {"langfuse_prompt": lf_prompt_goodbye}
+
+    trimmer = get_trimmer()
+    context_chain = context_prompt | trimmer | llm_with_tools | RunnableLambda(generate_context)
+    review_chain = review_prompt | trimmer | llm
+    goodbye_chain = goodbye_prompt | llm
+
+    # chain_context_with_message_history = RunnableWithMessageHistory(
+    #     runnable=context_chain, get_session_history=get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
+    # )
+    #
+    # chain_review_with_message_history = RunnableWithMessageHistory(
+    #     runnable=review_chain, get_session_history=get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
+    # )
 
     update_trace("main-trace")
     try:
@@ -301,24 +334,27 @@ def main():
                     data_type="CATEGORICAL",
                     comment=user_comment
                 )
-
+                chat_history.add_message(AIMessage(content=goodbye_message.content))
                 print(f"System: {goodbye_message.content}")
                 break
 
-            conversation.append(HumanMessage(user_input))
 
-            chain_context_with_message_history.invoke(
-                {"user_input": user_input, "conversation": conversation},
+            chat_history.add_message(HumanMessage(content=user_input))
+            trimmed_messages = trimmer.invoke(get_clean_messages())
+            context_chain.invoke(
+                {"user_id": user_id, "user_input": user_input, "conversation": trimmed_messages},
                 get_config("context", {"context": "invoke"})
             )
 
-            response = chain_review_with_message_history.invoke(
-                {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+            response = review_chain.invoke(
+                {"user_id": user_id, "user_input": user_input, "conversation": get_clean_messages()},
                 get_config("review", {"review": "invoke"})
             )
 
+            chat_history.add_message(AIMessage(content=response.content))
+
             print(f"System: {response.content}")
-            conversation.append(response)
+
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
