@@ -1,12 +1,14 @@
 import json
 import os
 import sys
-import uuid
 
 import dotenv
+import uvicorn
+from fastapi import FastAPI
+from pydantic import BaseModel
 from langchain_community.docstore.document import Document
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage, trim_messages
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -22,8 +24,14 @@ dotenv.load_dotenv()
 
 REDIS_URL = "redis://localhost:6380/0"
 
-users = ["James", "George", "Mike", "Sherlock"]
-user_id = users[uuid.uuid4().int % len(users)]
+app = FastAPI()
+
+
+class QueryRequest(BaseModel):
+    user_input: str
+    user_id: str
+    session_id: str
+
 
 llm = ChatOpenAI(
     model=os.getenv("LITELLM_MODEL"),
@@ -39,10 +47,8 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-chat_history = None
 
-
-def get_clean_messages():
+def get_clean_messages(chat_history):
     return [
         msg for msg in chat_history.messages
         if not isinstance(msg, ToolMessage)
@@ -127,7 +133,6 @@ def smartphone_info_tool(model: str) -> str:
     try:
         results = product_db.similarity_search(model, k=1)
         if not results:
-            print(f"Info: No results found for model: {model}")
             return "Could not find information for the specified model."
         info = results[0].page_content
         return info
@@ -135,8 +140,7 @@ def smartphone_info_tool(model: str) -> str:
         return f"Error during smartphone information retrieval for model {model}: {e}"
 
 
-@observe(name="generate-context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage, chat_history) -> dict:
     chat_history.add_message(ai_message)
 
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
@@ -179,15 +183,15 @@ def generate_context(ai_message: AIMessage) -> dict:
     return {"tool_responses": tool_responses}
 
 
-# noinspection PyTypeChecker
-@observe(name="main")
-def main():
-    global chat_history
+@app.post("/ask")
+def ask(request: QueryRequest):
+    user_input = request.user_input
+    user_id = request.user_id
+    session_id = request.session_id
 
-    session_name = f"session-{uuid.uuid4().hex[:8]}"
     langfuse_client = get_client()
 
-    chat_history = RedisChatMessageHistory(session_id=session_name, redis_url=REDIS_URL, ttl=300)
+    chat_history = RedisChatMessageHistory(session_id=session_id, redis_url=REDIS_URL, ttl=300)
 
     trimmer = trim_messages(
         strategy="last",
@@ -203,7 +207,7 @@ def main():
 
     with propagate_attributes(
         trace_name="ai-response",
-        session_id=session_name,
+        session_id=session_id,
         user_id=user_id,
     ):
         langfuse_handler = CallbackHandler()
@@ -215,7 +219,6 @@ def main():
 
         context_langfuse_prompt = langfuse_prompts.get_prompt("context-prompt")
         review_langfuse_prompt = langfuse_prompts.get_prompt("review-prompt")
-        goodbye_langfuse_prompt = langfuse_prompts.get_prompt("goodbye-prompt")
 
         context_prompt = ChatPromptTemplate.from_messages(
             [
@@ -235,84 +238,46 @@ def main():
         )
         review_prompt.metadata = {"langfuse_prompt": review_langfuse_prompt}
 
-        goodbye_prompt = ChatPromptTemplate.from_messages(
-            goodbye_langfuse_prompt.get_langchain_prompt()
+        # Check guardrails
+        rail_result = rails.invoke({"user_input": user_input})
+        if isinstance(rail_result, dict) and "I'm sorry, I can't respond to that" in rail_result.get("output", ""):
+            return {"response": rail_result["output"]}
+
+        chat_history.add_message(HumanMessage(content=user_input))
+
+        trimmed_messages = trimmer.invoke(get_clean_messages(chat_history))
+
+        # Context chain — get tool results
+        context_result = (context_prompt | llm_with_tools).invoke(
+            {"user_input": user_input, "conversation": trimmed_messages},
+            config={
+                "run_name": "context",
+                "callbacks": [langfuse_handler],
+                "metadata": {
+                    "langfuse_user_id": user_id,
+                    "langfuse_session_id": session_id,
+                },
+            },
         )
-        goodbye_prompt.metadata = {"langfuse_prompt": goodbye_langfuse_prompt}
+        generate_context(context_result, chat_history)
 
-        context_chain = context_prompt | llm_with_tools | generate_context
-        review_chain = review_prompt | llm
-        goodbye_chain = goodbye_prompt | llm
+        # Review chain — generate final response
+        response = (review_prompt | llm).invoke(
+            {"user_id": user_id, "user_input": user_input, "conversation": get_clean_messages(chat_history)},
+            config={
+                "run_name": "final-response",
+                "callbacks": [langfuse_handler],
+                "metadata": {
+                    "langfuse_user_id": user_id,
+                    "langfuse_session_id": session_id,
+                },
+            },
+        )
 
-        try:
-            print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
-            while True:
-                user_input = input("User: ").strip()
-                if user_input.lower() in ["exit", "quit", "bye", "end"]:
-                    feedback = input("Was this answer helpful? (Yes/No): ")
-                    user_comment = input("Please give us a reason for your answer. This will help us improve: ")
+        chat_history.add_message(response)
 
-                    langfuse_client.score_current_trace(
-                        name="usefulness",
-                        value=feedback,
-                        data_type="CATEGORICAL",
-                        comment=user_comment,
-                    )
-
-                    goodbye_message = goodbye_chain.invoke(
-                        {"user_id": user_id},
-                        config={
-                            "run_name": "goodbye-message",
-                            "callbacks": [langfuse_handler],
-                            "metadata": {
-                                "langfuse_user_id": user_id,
-                                "langfuse_session_id": session_name,
-                            },
-                        },
-                    )
-                    print(f"System: {goodbye_message.content}")
-                    break
-
-                rail_result = rails.invoke({"user_input": user_input})
-                if isinstance(rail_result, dict) and "I'm sorry, I can't respond to that" in rail_result.get("output", ""):
-                    print(f"System: {rail_result['output']}")
-                    continue
-
-                chat_history.add_message(HumanMessage(content=user_input))
-
-                trimmed_messages = trimmer.invoke(get_clean_messages())
-
-                context_chain.invoke(
-                    {"user_input": user_input, "conversation": trimmed_messages},
-                    config={
-                        "run_name": "context",
-                        "callbacks": [langfuse_handler],
-                        "metadata": {
-                            "langfuse_user_id": user_id,
-                            "langfuse_session_id": session_name,
-                        },
-                    },
-                )
-
-                response = review_chain.invoke(
-                    {"user_id": user_id, "user_input": user_input, "conversation": get_clean_messages()},
-                    config={
-                        "run_name": "final-response",
-                        "callbacks": [langfuse_handler],
-                        "metadata": {
-                            "langfuse_user_id": user_id,
-                            "langfuse_session_id": session_name,
-                        },
-                    },
-                )
-
-                print(f"System: {response.content}")
-                chat_history.add_message(response)
-
-        except Exception as e:
-            print(f"An unexpected error occurred in the main loop: {e}")
-            sys.exit(1)
+        return {"response": response.content}
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
