@@ -12,7 +12,7 @@ from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from langchain_redis import RedisChatMessageHistory
+from langchain_community.chat_message_histories import RedisChatMessageHistory
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
@@ -22,7 +22,7 @@ from langfuse import observe, get_client, propagate_attributes, Langfuse
 
 dotenv.load_dotenv()
 
-REDIS_URL = "redis://localhost:6380/0"
+REDIS_URL = os.environ["REDIS_CONN_STRING"]
 
 app = FastAPI()
 
@@ -58,17 +58,28 @@ def get_clean_messages(chat_history):
 
 @observe(name="embed-documents")
 def embed_documents(json_path: str):
+    collection_name = "smartphones"
+    qdrant_client = QdrantClient(
+        url=os.environ["QDRANT_URL"],
+        api_key=os.environ["QDRANT_API_KEY"],
+    )
+
+    collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
+    if collection_exists:
+        qdrant_store = QdrantVectorStore.from_existing_collection(
+            url=os.environ["QDRANT_URL"],
+            api_key=os.environ["QDRANT_API_KEY"],
+            embedding=embeddings_model,
+            collection_name=collection_name,
+        )
+        return qdrant_store
+
+    # If collection doesn't exist in cloud, create and populate it
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: The file {json_path} was not found.")
-        return []
-    except json.JSONDecodeError as jde:
-        print(f"Error decoding JSON from file {json_path}: {jde}")
-        return []
     except Exception as e:
-        print(f"An unexpected error occurred while reading {json_path}: {e}")
+        print(f"Error reading {json_path}: {e}")
         return []
 
     documents = []
@@ -89,41 +100,19 @@ def embed_documents(json_path: str):
         )
         documents.append(Document(page_content=content))
 
-    try:
-        collection_name = "smartphones"
-        qdrant_client = QdrantClient("http://localhost:6333")
+    qdrant_client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+    )
 
-        collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
-        if not collection_exists:
-            qdrant_client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=1536,
-                    distance=Distance.COSINE,
-                ),
-            )
-
-            qdrant_store = QdrantVectorStore(
-                client=qdrant_client,
-                collection_name=collection_name,
-                embedding=embeddings_model
-            )
-
-            qdrant_store.add_documents(documents=documents)
-
-            return qdrant_store
-
-        else:
-            qdrant_store = QdrantVectorStore.from_existing_collection(
-                embedding=embeddings_model,
-                collection_name=collection_name,
-            )
-
-            return qdrant_store
-
-    except Exception as e:
-        print(f"Error initializing the vector store: {e}")
-        return []
+    qdrant_store = QdrantVectorStore(
+        url=os.environ["QDRANT_URL"],
+        api_key=os.environ["QDRANT_API_KEY"],
+        collection_name=collection_name,
+        embedding=embeddings_model,
+    )
+    qdrant_store.add_documents(documents=documents)
+    return qdrant_store
 
 
 @tool("SmartphoneInfo")
@@ -191,7 +180,7 @@ def ask(request: QueryRequest):
 
     langfuse_client = get_client()
 
-    chat_history = RedisChatMessageHistory(session_id=session_id, redis_url=REDIS_URL, ttl=300)
+    chat_history = RedisChatMessageHistory(session_id=session_id, url=REDIS_URL, ttl=300)
 
     trimmer = trim_messages(
         strategy="last",
