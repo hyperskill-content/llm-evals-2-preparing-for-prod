@@ -83,8 +83,8 @@ async def score_observation(observation, user_input, chunks, response) -> None:
         answer=response.content
     )
     for key, entry in score.scores.items():
+        print(".", end="", flush=True)
         if entry.value is not None:
-            print(f"Adding metric {key}: {entry}")
             observation.score(
                 name=key,
                 value=entry.value,

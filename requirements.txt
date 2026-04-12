@@ -1,13 +1,18 @@
 # here are the dependencies for this project
 # feel free to add more/use different versions as needed
 
+langchain
 langchain-core
 langchain-openai
-python-dotenv
-langchain-community
-langfuse
-qdrant-client
+langchain-redis
 langchain_qdrant
-requests
-langchain
+langchain-community
+
+langfuse
+
 nemoguardrails
+
+python-dotenv
+qdrant-client
+redis
+requests
