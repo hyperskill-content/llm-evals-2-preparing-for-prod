@@ -52,6 +52,10 @@ langfuse_handler = CallbackHandler()
 conversation = []
 
 
+YES_VOTES = {"yes", "y", "yeah", "yup", "sure", "absolutely", "of course"}
+NO_VOTES = {"no", "n", "nope", "nop"}
+
+
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
 # ---------------------------
@@ -193,13 +197,13 @@ def get_context(user_input):
     return context_chain.invoke(
         {"user_input": user_input, "conversation": conversation},
         config={
-            "run_name": "context",
+            "run_name": "get_context",
             "callbacks": [langfuse_handler],
             "metadata": {"langfuse_tags": ["dev", "test"]}
         }
     )
 
-@observe(name="generate-context", as_type="retrieval")
+@observe(name="generate-context", as_type="retriever")
 def generate_context(ai_message: AIMessage) -> list[str]:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
@@ -248,12 +252,23 @@ def generate_context(ai_message: AIMessage) -> list[str]:
 # User Feedback Handling
 # ---------------------------
 def get_user_feedback() -> None:
-    feedback = input("Was this answer helpful? (Yes/No): ")
-    user_comment = input("Please give us a reason for your answer. This will help us improve: ")
+    feedback_value = None
+    while feedback_value is None:
+        feedback_input = input("Was this answer helpful? (Yes/No): ").strip().lower()
+        if feedback_input in YES_VOTES:
+            feedback_value = True
+        elif feedback_input in NO_VOTES:
+            feedback_value = False
+        elif feedback_input in ["", "exit", "quit"]:
+            return
+        else:
+            print("Please enter Yes or No (or 'exit' to skip).")
+
+    user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
     langfuse_client.score_current_trace(
         name="usefulness",
-        value=feedback,
-        data_type="CATEGORICAL",
+        value=feedback_value,
+        data_type="BOOLEAN",
         comment=user_comment
     )
 
@@ -264,7 +279,10 @@ def get_user_feedback() -> None:
 def generate_review(user_input: str, chunks: list[str]) :
     with langfuse_client.start_as_current_observation(name="generate-review",
                                                       as_type="generation",
-                                                      input=[user_input, *chunks]) as obs:
+                                                      input={
+                                                          "user_input": user_input,
+                                                          "chunks": chunks
+                                                      }) as obs:
         review_system_prompt = langfuse_client.get_prompt("review")
         langfuse_client.update_current_generation(prompt=review_system_prompt)
 
@@ -286,6 +304,7 @@ def generate_review(user_input: str, chunks: list[str]) :
                 metadata={"langfuse_tags": ["dev", "test"]}
             )
         )
+        langfuse_client.update_current_generation(output=response.content)
 
         scoring = asyncio.create_task(score_observation(obs, user_input, chunks, response))
     return response, scoring
@@ -353,7 +372,7 @@ async def main():
 
 
                     # update span and conversation history
-                    span.update(output=response.content, input=[user_input, *chunks])
+                    span.update(output=response.content)
                     conversation.append(response)
 
     except Exception as e:

@@ -42,7 +42,7 @@ class ReviewScore:
 
 async def score_faithfulness(query, chunks, answer) -> MetricResult:
     if not chunks:
-        return MetricResult(value=float("nan"))
+        return MetricResult(value=None, reason="No retrieved contexts")
     result = await Faithfulness(llm).ascore(
         user_input=query,
         retrieved_contexts=chunks,
@@ -59,7 +59,7 @@ async def score_relevancy(query, answer) -> MetricResult:
 
 async def score_context_precision(query, chunks, answer) -> MetricResult:
     if not chunks:
-        return MetricResult(value=float("nan"))
+        return MetricResult(value=None, reason="No retrieved contexts")
     result = await ContextPrecisionWithoutReference(llm).ascore(
         user_input=query,
         retrieved_contexts=chunks,
@@ -83,8 +83,8 @@ async def score_observation(observation, user_input, chunks, response) -> None:
         answer=response.content
     )
     for key, entry in score.scores.items():
-        print(f"Metrics for {key}: {entry}")
-        if entry.value:
+        if entry.value is not None:
+            print(f"Adding metric {key}: {entry}")
             observation.score(
                 name=key,
                 value=entry.value,
