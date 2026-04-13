@@ -16,6 +16,9 @@ from langfuse import LangfuseSpan
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+
 from ragas_eval import score_observation
 from user_feedback import get_user_feedback
 from knowledge_base import smartphone_info_tool
@@ -24,6 +27,7 @@ dotenv.load_dotenv()
 
 users = ["James", "George", "Mike", "Sherlock"]
 REDIS_URL = "redis://localhost:6380/0"
+guardrails_config = RailsConfig.from_path("config/config.yml")
 
 def init_langfuse() -> Langfuse:
     client = get_client()
@@ -58,6 +62,11 @@ class Agent:
         )
         self.tools = [smartphone_info_tool]
         self.session = session
+        self.guardrails = RunnableRails(
+            guardrails_config,
+            input_key="user_input",
+            input_blocked_message="I'm sorry, I can't respond to that."
+        )
         self.trimmer = trim_messages(
             strategy="last", # keep either the last or first messages
             token_counter=self.llm, # use your LLM to count tokens or create a special function
@@ -83,7 +92,7 @@ class Agent:
         )
         context_prompt.metadata = {"langfuse_prompt": context_system_prompt}
 
-        chain = context_prompt | self.trimmer | llm_with_tools | self.generate_context
+        chain = self.guardrails | context_prompt | self.trimmer | llm_with_tools | self.generate_context
 
         # We manually add the user message to the chat history before invoking the chain.
         # When passed as input_messages, it violates the AI message with tool calls followed by ToolMessages rule.
@@ -212,7 +221,6 @@ async def main():
     session_id = f"session-{uuid.uuid4().hex[:8]}"
     session = Session(session_id)
     agent = Agent(session)
-    chat_history = get_redis_history(session_id)
 
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
@@ -243,7 +251,7 @@ async def main():
                     response, scoring_task = agent.generate_review(user_input, chunks)
                     print(f"System: {response.content}")
 
-                    # add scoring task to awaitables
+                    # add scoring task for this turn to awaitables
                     awaitables.add(scoring_task)
                     scoring_task.add_done_callback(lambda _: awaitables.remove(scoring_task) if scoring_task in awaitables else None)
 
