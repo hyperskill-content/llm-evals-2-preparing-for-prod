@@ -5,11 +5,12 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import AIMessage, trim_messages
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, Langfuse
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -40,15 +41,37 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-# Initialize conversation history
-conversation = []
+# Initialize Redis connection for chat history
+REDIS_URL = "redis://localhost:6380/0"
 
 
-# ---------------------------
-# Load JSON Data and Build Qdrant Vector Store
-# ---------------------------
+def get_redis_history(session_id: str):
+    """
+    Retrieves or creates a RedisChatMessageHistory instance for the given session ID.
+    :param session_id: Unique identifier for the chat session.
+    :returns: A RedisChatMessageHistory object.
+    """
+    return RedisChatMessageHistory(session_id, redis_url=REDIS_URL, ttl=600)  # Setting TTL to 10 minutes
 
-@observe(name="embed-documents")
+
+def get_history_messages(session_id: str):
+    """
+    Retrieves and repairs chat history from Redis, restoring lost tool_calls in AIMessages.
+    :param session_id: Unique identifier for the chat session.
+    :returns: A list of Message objects.
+    """
+    history = get_redis_history(session_id)
+    messages = history.messages
+    for m in messages:
+        if isinstance(m, AIMessage) and "_tool_calls" in m.additional_kwargs:
+            try:
+                # Restore tool_calls from serialized additional_kwargs
+                m.tool_calls = json.loads(m.additional_kwargs["_tool_calls"])
+            except Exception:
+                pass
+    return messages
+
+
 def embed_documents(json_path: str):
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
@@ -160,42 +183,38 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage, session_id: str) -> None:
     """
-    Process tool calls from the language model and collect their responses as ToolMessage objects.
+    Process tool calls from the language model and collect their responses as ToolMessage objects
+    directly into Redis chat history.
 
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
-
-    :returns
-        A dictionary containing a list of ToolMessage objects under the key "tool_responses".
+        session_id (str): The current chat session ID.
     """
-    # construct the conversation history with the AI message containing tool calls
-    conversation.append(ai_message)
+    history = get_redis_history(session_id)
+
+    # Workaround for tool_calls serialization bug in langchain_redis
+    if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
+        ai_message.additional_kwargs["_tool_calls"] = json.dumps(ai_message.tool_calls)
+
+    history.add_message(ai_message)
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
+        return
 
     try:
-        # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-        # a message with tool calls is expected to be followed by tool responses
+        # Process each tool call, invoke the appropriate tool, and append the result to Redis
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
+                from langchain_core.messages import ToolMessage
+                history.add_message(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
-            AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
-            )
-        )
+        history.add_ai_message(f"An error occurred while processing tool calls: {e}")
 
 
 # ---------------------------
@@ -205,10 +224,16 @@ def generate_context(ai_message: AIMessage) -> dict:
 def main():
     session_id = f"session-{uuid.uuid4().hex[:8]}"
     user_id = users[uuid.uuid4().int % len(users)]
+    history = get_redis_history(session_id)
 
-    # Langfuse trace update (using the client if update_current_trace is not available in this SDK version)
-    # Note: In SDK v3, trace attributes are often managed via the CallbackHandler or as parameters.
-    # We will ensure the session and user IDs are passed to all chain invocations.
+    # Define a trimmer to manage message history length
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=llm,
+        max_tokens=600,
+        start_on="human",
+        include_system=True,
+    )
 
     # List of available tools
     tools = [smartphone_info_tool]
@@ -229,6 +254,7 @@ def main():
         ]
     )
     context_prompt.metadata = {"langfuse_prompt": context_system_prompt}
+
     review_prompt = ChatPromptTemplate.from_messages(
         [
             review_system_prompt.get_langchain_prompt()[0],
@@ -245,9 +271,8 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | llm_with_tools
     review_chain = review_prompt | llm
-
     goodbye_chain = goodbye_prompt | llm
 
     try:
@@ -281,9 +306,13 @@ def main():
                 print(f"System: {goodbye_message.content}")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            # Add human message to Redis history
+            history.add_user_message(user_input)
 
-            context_chain.invoke(
+            # Retrieve and trim messages for context
+            conversation = trimmer.invoke(get_history_messages(session_id))
+
+            ai_msg_with_tools = context_chain.invoke(
                 {"user_input": user_input, "conversation": conversation},
                 config={
                     "run_name": "context",
@@ -294,6 +323,12 @@ def main():
                     },
                 }
             )
+
+            # Process tool calls and update Redis history
+            generate_context(ai_msg_with_tools, session_id)
+
+            # Update conversation after tools for the final response
+            conversation = trimmer.invoke(get_history_messages(session_id))
 
             response = review_chain.invoke(
                 {"user_id": user_id, "user_input": user_input, "conversation": conversation},
@@ -308,7 +343,8 @@ def main():
             )
 
             print(f"System: {response.content}")
-            conversation.append(response)
+            # Add final AI response to Redis history
+            history.add_ai_message(response.content)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
