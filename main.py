@@ -200,7 +200,7 @@ def generate_context(ai_message: AIMessage) -> dict:
                     tool_output = smartphone_info_tool.invoke(
                         input=tool_call,
                         config={
-                            "run-name": "smartphone-info-tool",
+                            "run_name": "smartphone-info-tool",
                             "callbacks": [langfuse_handler],
                             "metadata": {
                                 "langfuse_session_id": session_id,
