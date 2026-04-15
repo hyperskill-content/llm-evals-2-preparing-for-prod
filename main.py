@@ -6,7 +6,7 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import AIMessage, trim_messages
+from langchain_core.messages import AIMessage, trim_messages, messages_from_dict, message_to_dict
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
@@ -301,20 +301,20 @@ def main():
 
     # Load rails config
     rails_config = RailsConfig.from_path("config")
-    # create an instance of the guardrails
-    rails = RunnableRails(rails_config, input_key="user_input")
 
-    # wrap the context chain with rails
-    def context_chain_with_rails_invoke(input_data, config=None):
-        # We call rails with only user_input to avoid serialization error
-        # We need to preserve the result if triggered
-        res = rails.invoke({"user_input": input_data["user_input"]}, config=config)
-        if isinstance(res, dict) and res.get("output") == "I'm sorry, I can't respond to that.":
-            return res
-        # If not triggered, call the real chain
-        return context_chain.invoke(input_data, config=config)
+    # Wrap context_chain so it deserializes the conversation (dicts → LangChain message objects)
+    # before invoking. This is needed because RunnableRails cannot serialize LangChain message
+    # objects, so we convert them to dicts before passing to RunnableRails and back afterward.
+    context_chain_deserializer = RunnableLambda(
+        lambda x: context_chain.invoke({
+            "user_input": x["user_input"],
+            "conversation": messages_from_dict(x.get("conversation", [])),
+        })
+    )
 
-    context_chain_with_rails = RunnableLambda(context_chain_with_rails_invoke)
+    # RunnableRails calls context_chain_deserializer directly when input is not blocked,
+    # avoiding the extra LLM call that occurred with the previous approach.
+    context_chain_with_rails = RunnableRails(rails_config, runnable=context_chain_deserializer, input_key="user_input")
 
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
@@ -353,8 +353,12 @@ def main():
             # Retrieve and trim messages for context
             conversation = trimmer.invoke(get_history_messages(session_id))
 
+            # Serialize LangChain message objects to dicts so RunnableRails can handle them.
+            # The deserializer wrapper inside context_chain_with_rails converts them back.
+            serialized_conversation = [message_to_dict(m) for m in conversation]
+
             ai_msg_with_tools = context_chain_with_rails.invoke(
-                {"user_input": user_input, "conversation": conversation},
+                {"user_input": user_input, "conversation": serialized_conversation},
                 config={
                     "run_name": "context",
                     "callbacks": [langfuse_handler],
