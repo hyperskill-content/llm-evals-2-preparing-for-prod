@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import uuid
@@ -7,10 +8,13 @@ import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from langfuse import observe, Langfuse
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -18,10 +22,30 @@ from qdrant_client.http.models import Distance, VectorParams
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+os.environ["OPENAI_API_BASE"] = os.getenv("OPENAI_BASE_URL")
+
+# Configure logging
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(name)s %(levelname)s   %(message)s', datefmt='%H:%M:%S')
+# Ensure only guardrails actions are logged at INFO level to match task_3.md requirements
+logging.getLogger("actions.py").setLevel(logging.INFO)
 
 # Initialize Langfuse Callback Handler
 langfuse_handler = CallbackHandler()
 langfuse_client = Langfuse()
+
+total_cost = 0.0
+
+
+def update_usage(response):
+    global total_cost
+    if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        usage = response.usage_metadata
+        input_tokens = usage.get('input_tokens', 0)
+        output_tokens = usage.get('output_tokens', 0)
+        # gpt-4o-mini prices: $0.15 / 1M input, $0.60 / 1M output
+        cost = (input_tokens * 0.15 + output_tokens * 0.60) / 1_000_000
+        total_cost += cost
+    return total_cost
 
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
@@ -275,6 +299,23 @@ def main():
     review_chain = review_prompt | llm
     goodbye_chain = goodbye_prompt | llm
 
+    # Load rails config
+    rails_config = RailsConfig.from_path("config")
+    # create an instance of the guardrails
+    rails = RunnableRails(rails_config, input_key="user_input")
+
+    # wrap the context chain with rails
+    def context_chain_with_rails_invoke(input_data, config=None):
+        # We call rails with only user_input to avoid serialization error
+        # We need to preserve the result if triggered
+        res = rails.invoke({"user_input": input_data["user_input"]}, config=config)
+        if isinstance(res, dict) and res.get("output") == "I'm sorry, I can't respond to that.":
+            return res
+        # If not triggered, call the real chain
+        return context_chain.invoke(input_data, config=config)
+
+    context_chain_with_rails = RunnableLambda(context_chain_with_rails_invoke)
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
@@ -312,7 +353,7 @@ def main():
             # Retrieve and trim messages for context
             conversation = trimmer.invoke(get_history_messages(session_id))
 
-            ai_msg_with_tools = context_chain.invoke(
+            ai_msg_with_tools = context_chain_with_rails.invoke(
                 {"user_input": user_input, "conversation": conversation},
                 config={
                     "run_name": "context",
@@ -323,6 +364,14 @@ def main():
                     },
                 }
             )
+
+            # Check if input rail was triggered
+            if isinstance(ai_msg_with_tools, dict) and ai_msg_with_tools.get("output") == "I'm sorry, I can't respond to that.":
+                print(f"System: {ai_msg_with_tools['output']}")
+                print(f"Your usage so far: {total_cost}")
+                continue
+
+            update_usage(ai_msg_with_tools)
 
             # Process tool calls and update Redis history
             generate_context(ai_msg_with_tools, session_id)
@@ -343,6 +392,8 @@ def main():
             )
 
             print(f"System: {response.content}")
+            update_usage(response)
+            print(f"Your usage so far: {total_cost}")
             # Add final AI response to Redis history
             history.add_ai_message(response.content)
 
