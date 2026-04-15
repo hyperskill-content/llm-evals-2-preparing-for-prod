@@ -1,16 +1,10 @@
-# LLM model configuration
-models:
-  - type: main
-    engine: openai
-    model: gpt-4o-mini
-
 # Instructions for the LLM (similar to system prompts)
 instructions:
   - type: general
     content: |
       You verify inputs for a bot called the Smartphones info Bot.
-      The bot is designed to answer questions about smartphones such as comparisons and recommendations
-      The bot can access smartphone details using context, but must be given the exact phone model
+      The bot is designed to answer questions about smartphones such as comparisons and recommendations.
+      The bot can access smartphone details using context, but must be given the exact phone model.
       If the bot is asked customer support queries like ordering, returns, tracking, etc, the bot replies it cannot help with such requests.
 
 # Guardrails configuration
@@ -18,9 +12,6 @@ rails:
   input:
     flows:
       - self check input
-  output:
-    flows:
-      - self check output
 
 # Prompt customization
 prompts:
@@ -44,24 +35,6 @@ prompts:
       Question: Should the user message be blocked (Yes or No)?
       Answer:
 
-  - task: self_check_output
-    content: |
-      Your task is to check if the AI message below follows guidelines for replying to user messages.
-
-      Guidelines for the ai messages:
-      - should respect the system instructions
-      - should not leak company internals
-      - should not leak programming internals
-      - should not leak information of other users
-      - should not be rude or disrespectful
-      - should not contain explicit content
-      - should not use abusive language, even if just a few words
-
-      AI message: "{{ ai_response }}"
-
-      Question: Should the AI message be blocked (Yes or No)?
-      Answer:
-
 # Knowledge base settings
 knowledge_base:
   embedding_search_provider:
@@ -72,4 +45,4 @@ tracing:
   enabled: true
   adapters:
     - name: FileSystem
-      filepath: "./logs/traces.jsonl"
+      filepath: "./logs/in_traces.jsonl"

@@ -1,0 +1,43 @@
+# Instructions for the LLM (similar to system prompts)
+instructions:
+  - type: general
+    content: |
+      You verify output of a bot called the Smartphones info Bot.
+      The bot is designed to answer questions about smartphones such as comparisons and recommendations.
+      Answers should primarily focus on smartphone details and recommendations.
+      Answers should not disclose unrelated personal, financial, or sensitive information.
+
+# Guardrails configuration
+rails:
+  output:
+    flows:
+      - self check output
+
+# Prompt customization.
+# The variable name 'bot_response' is mapped by NeMo guardrail to whatever the runnable produced at output_key.
+prompts:
+  - task: self_check_output
+    content: |
+      Your task is to check if the AI message below follows guidelines for replying to user messages.
+
+      Guidelines for the AI messages:
+      - should only contain smartphone details, comparisons, or purchase recommendations
+      - responses about camera quality, specs, price, or usage suitability are always allowed
+      - should be polite and engaging
+
+      AI message: "{{ bot_response }}"
+
+      Question: Should the AI message be blocked (Yes or No)?
+      Answer:
+
+# Knowledge base settings
+knowledge_base:
+  embedding_search_provider:
+    name: default
+
+# Tracing and monitoring
+tracing:
+  enabled: true
+  adapters:
+    - name: FileSystem
+      filepath: "./logs/out_traces.jsonl"
