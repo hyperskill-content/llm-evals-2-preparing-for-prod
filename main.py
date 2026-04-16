@@ -24,20 +24,12 @@ user_id = users[uuid.uuid4().int % len(users)]
 
 langfuse_client = get_client()
 
-# See all available 'current' methods
-print([m for m in dir(langfuse_client) if 'current' in m.lower()])
-
-# See exact signature of update_current_span
-print(inspect.signature(langfuse_client.update_current_span))
-
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL"),
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
-# Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
     base_url=os.getenv("OPENAI_BASE_URL"),
@@ -45,13 +37,7 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# Initialize conversation history
 conversation = []
-
-
-# ---------------------------
-# Load JSON Data and Build Qdrant Vector Store
-# ---------------------------
 
 @observe(name="embed-documents")
 def embed_documents(json_path: str):
@@ -80,7 +66,6 @@ def embed_documents(json_path: str):
 
     documents = []
     for entry in data:
-        # Build a readable content string from the JSON entry
         content = (
             f"Model: {entry.get('model', '')}\n"
             f"Price: {entry.get('price', '')}\n"
@@ -121,7 +106,6 @@ def embed_documents(json_path: str):
 
             return qdrant_store
 
-        # no need to create a vector store every time
         else:
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
@@ -135,13 +119,8 @@ def embed_documents(json_path: str):
         return []
 
 
-# Initialize the vector store
 product_db = embed_documents("datasets/smartphones.json")
 
-
-# ---------------------------
-# Tool Definitions
-# ---------------------------
 @tool("SmartphoneInfo")
 def smartphone_info_tool(model: str) -> str:
     """
@@ -164,10 +143,6 @@ def smartphone_info_tool(model: str) -> str:
     except Exception as e:
         return f"Error during smartphone information retrieval for model {model}: {e}"
 
-
-# ---------------------------
-# Tool Call Handling and Response Generation
-# ---------------------------
 @observe(name="generate-context")
 def generate_context(ai_message: AIMessage, session_id: str) -> dict:
     """
@@ -191,8 +166,6 @@ def generate_context(ai_message: AIMessage, session_id: str) -> dict:
         )
 
     try:
-        # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-        # a message with tool calls is expected to be followed by tool responses
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
@@ -209,10 +182,6 @@ def generate_context(ai_message: AIMessage, session_id: str) -> dict:
 
 langfuse_handler = CallbackHandler()
 
-
-# ---------------------------
-# Main Conversation Loop
-# ---------------------------
 @observe(name="main")
 @propagate_attributes()
 def main():
@@ -250,7 +219,6 @@ def main():
 
     tools = [smartphone_info_tool]
 
-    # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
     def generate_context_with_session(ai_message: AIMessage):
