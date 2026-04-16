@@ -7,10 +7,12 @@ import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import AIMessage
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -42,12 +44,14 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# Initialize conversation history
-chat_history = RedisChatMessageHistory(
-    session_id="hyper",
-    redis_url=REDIS_URL,
-    ttl=3600
-)
+
+def get_redis_history() -> BaseChatMessageHistory:
+    return RedisChatMessageHistory(
+        session_id,
+        REDIS_URL,
+        ttl=3600
+    )
+
 
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
@@ -172,7 +176,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage) -> AIMessage:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
 
@@ -180,28 +184,20 @@ def generate_context(ai_message: AIMessage) -> dict:
         ai_message (AIMessage): The language model's output message containing tool_calls.
 
     :returns
-        A dictionary containing a list of ToolMessage objects under the key "tool_responses".
+        An AIMessage containing the combined tool outputs.
     """
     with propagate_attributes(
         trace_name="ai-response",
         session_id=session_id,
         user_id=user_id
     ):
-        # construct the conversation history with the AI message containing tool calls
-        print("Before")
-        chat_history.add_ai_message(ai_message)
-        print("After")
-
-        # Check if the AI message has any tool calls
-        if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-            chat_history.add_ai_message("No tool calls found. Please ensure the model is configured to use tools.")
-
+        tool_outputs = []
         try:
             # Process each tool call, invoke the appropriate tool, and append the result to the conversation
             # a message with tool calls is expected to be followed by tool responses
             for tool_call in ai_message.tool_calls:
                 if tool_call["name"] == "SmartphoneInfo":
-                    tool_output = smartphone_info_tool.invoke(
+                    tool_message = smartphone_info_tool.invoke(
                         input=tool_call,
                         config={
                             "run_name": "smartphone-info-tool",
@@ -212,11 +208,15 @@ def generate_context(ai_message: AIMessage) -> dict:
                             }
                         }
                     )
-                    chat_history.add_ai_message(tool_output.content)
-
+                    tool_outputs.append(tool_message.content)
         except Exception as e:
             print(f"An error occurred while processing tool calls: {e}")
-            chat_history.add_ai_message(f"An error occurred while processing tool calls: {e}")
+
+        # Writing out tool_outputs to an AIMessage, as RunnableWithMessageHistory is not preserving the 'tool_calls'
+        # attribute, and according to the OpenAI API spec, messages with role 'tool' must be preceded by a message
+        # with 'tool_calls'. Ideally, we would want to return List[ToolMessage] here.
+        combined_content = "\n".join(tool_outputs)
+        return AIMessage(content=combined_content)
 
 
 # ---------------------------
@@ -248,7 +248,20 @@ def main():
         goodbye_prompt_template.metadata = {"langfuse_prompt": goodbye_prompt}
 
         context_chain = context_prompt_template | llm_with_tools | generate_context
+        context_chain_with_message_history = RunnableWithMessageHistory(
+            runnable=context_chain,
+            get_session_history=get_redis_history,
+            input_messages_key="user_input",
+            history_messages_key="conversation"
+        )
+
         review_chain = review_prompt_template | llm
+        review_chain_with_message_history = RunnableWithMessageHistory(
+            runnable=review_chain,
+            get_session_history=get_redis_history,
+            input_messages_key="user_input",
+            history_messages_key="conversation"
+        )
 
         goodbye_chain = goodbye_prompt_template | llm
 
@@ -279,15 +292,15 @@ def main():
                     print(f"System: {goodbye_message.content}")
                     break
 
-                chat_history.add_user_message(user_input)
-
-                context_chain.invoke(
+                context_chain_with_message_history.invoke(
                     input={
-                        "user_input": user_input,
-                        "conversation": chat_history.messages # TODO
+                        "user_input": user_input
                     },
                     config={
                         "run_name": "context",
+                        "configurable": {
+                            "session_id": session_id
+                        },
                         "callbacks": [langfuse_handler],
                         "metadata": {
                             "langfuse_session_id": session_id,
@@ -296,14 +309,17 @@ def main():
                     }
                 )
 
-                response = review_chain.invoke(
+
+                response = review_chain_with_message_history.invoke(
                     input={
                         "user_id": user_id,
-                        "user_input": user_input,
-                        "conversation": chat_history.messages # TODO
+                        "user_input": user_input
                     },
                     config={
                         "run_name": "final-response",
+                        "configurable": {
+                            "session_id": session_id
+                        },
                         "callbacks": [langfuse_handler],
                         "metadata": {
                             "langfuse_session_id": session_id,
@@ -313,7 +329,6 @@ def main():
                 )
 
                 print(f"System: {response.content}")
-                chat_history.add_ai_message(response)
 
         except Exception as e:
             print(f"An unexpected error occurred in the main loop: {e}")
