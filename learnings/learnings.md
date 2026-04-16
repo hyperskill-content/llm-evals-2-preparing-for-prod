@@ -222,4 +222,80 @@ logging.getLogger("actions.py").setLevel(logging.INFO)
 Output example:
 ```
 00:34:05 actions.py INFO   Input self-checking result is: `Yes`.
+
+---
+
+### Task 4: LiteLLM Proxy and Session-aware Logging
+
+#### 1. LiteLLM Proxy Setup & Virtual Keys
+LiteLLM provides a unified interface for multiple LLM providers and adds management features like budgets and rate limits via **Virtual Keys**.
+
+**Generate a Virtual Key via API:**
+```bash
+curl 'http://0.0.0.0:4000/key/generate' \
+--header 'Authorization: Bearer <master-key>' \
+--header 'Content-Type: application/json' \
+--data-raw '{"models": ["gpt-4o-mini"], "max_budget": 1.0, "budget_duration": "1d"}'
+```
+
+**Client Configuration:**
+Set the `OPENAI_BASE_URL` to your proxy and use the virtual key as `OPENAI_API_KEY`.
+
+#### 2. Session & User Attribution in LiteLLM
+To group logs and track costs per user/session in the LiteLLM Dashboard, metadata must be passed with every request.
+
+**Binding Metadata to LangChain LLMs:**
+Use `.bind()` to attach the `user` and `extra_body` (for custom metadata) to the LLM instance.
+```python
+# Bind user and session metadata
+llm_session = llm.bind(
+    user=user_id,
+    extra_body={"metadata": {"session_id": session_id}}
+)
+
+# Use the bound LLM in your chains
+chain = prompt | llm_session
+```
+
+#### 3. Tracking RAG (Embeddings) in Sessions
+Embedding calls are often logged as separate, unrelated entries. To link them to a chat session, you must pass the same metadata to the embedding model.
+
+**Session-aware Embeddings in Tools:**
+```python
+def smartphone_info_tool(model: str, user_id: str, session_id: str):
+    # Create transient embeddings instance with metadata
+    tool_embeddings = OpenAIEmbeddings(
+        ...,
+        model_kwargs={
+            "user": user_id,
+            "extra_body": {"metadata": {"session_id": session_id, "tool": "SmartphoneInfo"}}
+        }
+    )
+    # Use this instance for vector store retrieval
+    product_db = QdrantVectorStore.from_existing_collection(embedding=tool_embeddings, ...)
+    ...
+```
+
+#### 4. Preserving Metadata through Guardrails
+When using `RunnableRails` with a `runnable`, metadata passed in the `config` of the outer `invoke()` call can get lost. To fix this, inject the metadata explicitly inside the `RunnableLambda` wrapper:
+
+```python
+context_chain_deserializer = RunnableLambda(
+    lambda x: context_chain.invoke(
+        {...},
+        config={
+            "metadata": {
+                "langfuse_session_id": session_id,
+                "langfuse_user_id": user_id,
+            }
+        }
+    )
+)
+```
+
+#### Key Benefits
+- **Consolidated Logs:** Filtering by `session_id` in LiteLLM shows the entire trace (LLM calls, Guardrails checks, and Embeddings).
+- **Accurate Budgeting:** Costs for both Chat and Embeddings are aggregated under the correct Virtual Key and User ID.
+- **Improved Debugging:** Metadata like `"tool": "SmartphoneInfo"` helps identify which component triggered a specific API call.
+
 ```
