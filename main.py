@@ -5,11 +5,12 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import AIMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -17,6 +18,8 @@ from qdrant_client.http.models import Distance, VectorParams
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+REDIS_URL = "redis://localhost:6380/0"
 
 langfuse_client = get_client()
 langfuse_handler = CallbackHandler()
@@ -40,8 +43,11 @@ embeddings_model = OpenAIEmbeddings(
 )
 
 # Initialize conversation history
-conversation = []
-
+chat_history = RedisChatMessageHistory(
+    session_id="hyper",
+    redis_url=REDIS_URL,
+    ttl=3600
+)
 
 # ---------------------------
 # Load JSON Data and Build Qdrant Vector Store
@@ -182,15 +188,13 @@ def generate_context(ai_message: AIMessage) -> dict:
         user_id=user_id
     ):
         # construct the conversation history with the AI message containing tool calls
-        conversation.append(ai_message)
+        print("Before")
+        chat_history.add_ai_message(ai_message)
+        print("After")
 
         # Check if the AI message has any tool calls
         if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-            conversation.append(
-                AIMessage(
-                    content="No tool calls found. Please ensure the model is configured to use tools."
-                )
-            )
+            chat_history.add_ai_message("No tool calls found. Please ensure the model is configured to use tools.")
 
         try:
             # Process each tool call, invoke the appropriate tool, and append the result to the conversation
@@ -208,15 +212,11 @@ def generate_context(ai_message: AIMessage) -> dict:
                             }
                         }
                     )
-                    conversation.append(tool_output)
+                    chat_history.add_ai_message(tool_output.content)
 
         except Exception as e:
             print(f"An error occurred while processing tool calls: {e}")
-            conversation.append(
-                AIMessage(
-                    content=f"An error occurred while processing tool calls: {e}"
-                )
-            )
+            chat_history.add_ai_message(f"An error occurred while processing tool calls: {e}")
 
 
 # ---------------------------
@@ -279,12 +279,12 @@ def main():
                     print(f"System: {goodbye_message.content}")
                     break
 
-                conversation.append(HumanMessage(user_input))
+                chat_history.add_user_message(user_input)
 
                 context_chain.invoke(
                     input={
                         "user_input": user_input,
-                        "conversation": conversation
+                        "conversation": chat_history.messages # TODO
                     },
                     config={
                         "run_name": "context",
@@ -300,7 +300,7 @@ def main():
                     input={
                         "user_id": user_id,
                         "user_input": user_input,
-                        "conversation": conversation
+                        "conversation": chat_history.messages # TODO
                     },
                     config={
                         "run_name": "final-response",
@@ -313,7 +313,7 @@ def main():
                 )
 
                 print(f"System: {response.content}")
-                conversation.append(response)
+                chat_history.add_ai_message(response)
 
         except Exception as e:
             print(f"An unexpected error occurred in the main loop: {e}")
