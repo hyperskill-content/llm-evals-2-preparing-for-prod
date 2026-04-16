@@ -45,4 +45,4 @@ tracing:
   enabled: true
   adapters:
     - name: FileSystem
-      filepath: "./logs/in_traces.jsonl"
+      filepath: "./guardrails/logs/in_traces.jsonl"

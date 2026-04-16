@@ -31,8 +31,8 @@ dotenv.load_dotenv()
 
 users = ["James", "George", "Mike", "Sherlock"]
 REDIS_URL = "redis://localhost:6380/0"
-guardrails_config_in = RailsConfig.from_path("config/input/")
-guardrails_config_out = RailsConfig.from_path("config/output/")
+guardrails_config_in = RailsConfig.from_path("guardrails/input/")
+guardrails_config_out = RailsConfig.from_path("guardrails/output/")
 BLOCKED_QUERY_MSG = "I'm sorry, I can't respond to that."
 BLOCKED_OUTPUT_MSG = "Sorry, something went wrong. Please try again."
 
@@ -70,7 +70,9 @@ class Agent:
     def __init__(self, session: Session):
         self.llm = ChatOpenAI(
             model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            base_url=os.getenv("OPENAI_BASE_URL")
+            base_url="http://0.0.0.0:4000/",
+            api_key=os.getenv("LITELLM_API_KEY"),
+            model_kwargs={"user": "HyperUser"},
         )
         self.tools = [smartphone_info_tool]
         self.session = session

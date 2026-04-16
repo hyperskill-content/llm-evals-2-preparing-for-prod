@@ -1,0 +1,26 @@
+model_list:
+  - model_name: gpt-4o-mini # this is the model name your application will use for instance the chat model
+    litellm_params: 
+      model: gpt-4o-mini # the actual model that LiteLLM will call
+      api_base: os.environ/OPENAI_BASE_URL # the actual base URL for your model provider
+      api_key: os.environ/OPENAI_API_KEY # does os.getenv("actual_api_key") to get your actual API key
+      rpm: 10 # Rate limit for this deployment: in requests per minute (rpm)
+      tpm: 500 # token limit for this deployment: in tokens per minute (tpm)
+      num_retries: 3
+      
+  - model_name: embeddings_ada # another model for you application for example the embeddings model
+    litellm_params:
+      model: text-embedding-ada-002 # model name that LiteLLM will call
+      api_key: os.environ/OPENAI_API_KEY # does os.getenv("another_actual_api_key") to get your actual API key
+      num_retries: 5 
+      mode: embedding
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY # the master key the app will use. must start with sk
+  salt_key: os.environ/LITELLM_SALT # used to encrypt and decrypt your API key. Use https://1password.com/password-generator to generate a good one
+  database_url: "postgresql://llmproxy:dbpassword9090@db:5432/litellm" 
+  proxy_batch_write_at: 1
+  telemetry: false
+litellm_settings: # module level litellm settings - https://github.com/BerriAI/litellm/blob/main/litellm/__init__.py
+  drop_params: True
+  success_callback: ["langfuse", "prometheus"] # OPTIONAL - if you want to start sending LLM Logs to Langfuse. Make sure to set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in your env
+  

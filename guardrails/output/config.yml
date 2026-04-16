@@ -40,4 +40,4 @@ tracing:
   enabled: true
   adapters:
     - name: FileSystem
-      filepath: "./logs/out_traces.jsonl"
+      filepath: "./guardrails/logs/out_traces.jsonl"

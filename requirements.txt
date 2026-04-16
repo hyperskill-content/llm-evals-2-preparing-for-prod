@@ -2,6 +2,7 @@
 # feel free to add more/use different versions as needed
 
 langchain
+langchain-community
 langchain-core
 langchain-openai
 langchain-redis
@@ -14,5 +15,6 @@ nemoguardrails
 
 python-dotenv
 qdrant-client
+ragas
 redis
 requests
