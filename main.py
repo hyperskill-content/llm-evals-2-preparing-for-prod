@@ -63,6 +63,10 @@ embeddings_model = OpenAIEmbeddings(
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
     show_progress_bar=True,
+    model_kwargs={
+        "user": user_id,
+        "extra_body": {"metadata": {"session_id": "embeddings-init"}}
+    }
 )
 
 # Initialize Redis connection for chat history
@@ -96,16 +100,20 @@ def get_history_messages(session_id: str):
     return messages
 
 
-def embed_documents(json_path: str):
+def embed_documents(json_path: str, custom_embeddings=None):
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
     :param
         json_path (str): Path to the JSON file containing smartphone data.
+    :param
+        custom_embeddings: Optional embeddings model to use for the vector store.
 
     :returns
         Qdrant vector store A Qdrant vector store built from the smartphone documents,
                 or an empty list if an error occurs.
     """
+    # Use provided embeddings or fallback to global embeddings_model
+    embeddings = custom_embeddings if custom_embeddings else embeddings_model
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
@@ -155,7 +163,7 @@ def embed_documents(json_path: str):
             qdrant_store = QdrantVectorStore(
                 client=qdrant_client,
                 collection_name=collection_name,
-                embedding=embeddings_model
+                embedding=embeddings
             )
 
             qdrant_store.add_documents(documents=documents)
@@ -165,7 +173,7 @@ def embed_documents(json_path: str):
         # no need to create a vector store every time
         else:
             qdrant_store = QdrantVectorStore.from_existing_collection(
-                embedding=embeddings_model,
+                embedding=embeddings,
                 collection_name=collection_name,
             )
 
@@ -180,18 +188,36 @@ def embed_documents(json_path: str):
 # Tool Definitions
 # ---------------------------
 @tool("SmartphoneInfo")
-def smartphone_info_tool(model: str) -> str:
+def smartphone_info_tool(model: str, user_id: str = "default", session_id: str = "default") -> str:
     """
     Retrieves information about a smartphone model from the product database.
 
     :param
         model (str): The smartphone model to search for.
+    :param
+        user_id (str): The user ID for logging.
+    :param
+        session_id (str): The session ID for logging.
 
     :returns
         str: The smartphone's specifications, price, and availability,
              or an error message if not found or if an error occurs.
     """
-    product_db = embed_documents("datasets/smartphones.json")
+    # Create a transient embeddings instance with session metadata for this specific tool call
+    tool_embeddings = OpenAIEmbeddings(
+        model="text-embedding-ada-002",
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        model_kwargs={
+            "user": user_id,
+            "extra_body": {"metadata": {"session_id": session_id, "tool": "SmartphoneInfo"}}
+        }
+    )
+    
+    # Pass the custom embeddings to embed_documents if needed, 
+    # but here we just need to ensure the retrieval uses them.
+    # Since embed_documents uses the global embeddings_model, we should ideally pass it.
+    product_db = embed_documents("datasets/smartphones.json", tool_embeddings)
     try:
         results = product_db.similarity_search(model, k=1)
         if not results:
@@ -207,7 +233,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage, session_id: str) -> None:
+def generate_context(ai_message: AIMessage, session_id: str, user_id: str) -> None:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects
     directly into Redis chat history.
@@ -215,6 +241,7 @@ def generate_context(ai_message: AIMessage, session_id: str) -> None:
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
         session_id (str): The current chat session ID.
+        user_id (str): The current user ID.
     """
     history = get_redis_history(session_id)
 
@@ -232,7 +259,12 @@ def generate_context(ai_message: AIMessage, session_id: str) -> None:
         # Process each tool call, invoke the appropriate tool, and append the result to Redis
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
-                tool_output = smartphone_info_tool.invoke(tool_call)
+                # Inject user_id and session_id into tool arguments
+                tool_args = tool_call["args"].copy()
+                tool_args["user_id"] = user_id
+                tool_args["session_id"] = session_id
+                
+                tool_output = smartphone_info_tool.invoke(tool_args)
                 from langchain_core.messages import ToolMessage
                 history.add_message(ToolMessage(content=str(tool_output), tool_call_id=tool_call["id"]))
 
@@ -262,8 +294,17 @@ def main():
     # List of available tools
     tools = [smartphone_info_tool]
 
-    # Bind the tools to the language model instance
-    llm_with_tools = llm.bind_tools(tools)
+    # Bind the tools to the language model instance and add LiteLLM user/metadata
+    llm_with_tools = llm.bind_tools(tools).bind(
+        user=user_id,
+        extra_body={"metadata": {"session_id": session_id}}
+    )
+
+    # Bind LiteLLM user/metadata to the base LLM as well
+    llm_session = llm.bind(
+        user=user_id,
+        extra_body={"metadata": {"session_id": session_id}}
+    )
 
     # Get the prompts from Langfuse
     context_system_prompt = langfuse_client.get_prompt("context_system_prompt")
@@ -296,8 +337,8 @@ def main():
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_system_prompt}
 
     context_chain = context_prompt | llm_with_tools
-    review_chain = review_prompt | llm
-    goodbye_chain = goodbye_prompt | llm
+    review_chain = review_prompt | llm_session
+    goodbye_chain = goodbye_prompt | llm_session
 
     # Load rails config
     rails_config = RailsConfig.from_path("config")
@@ -305,11 +346,21 @@ def main():
     # Wrap context_chain so it deserializes the conversation (dicts → LangChain message objects)
     # before invoking. This is needed because RunnableRails cannot serialize LangChain message
     # objects, so we convert them to dicts before passing to RunnableRails and back afterward.
+    # We also explicitly pass session metadata to ensure it's not lost when called by Rails.
     context_chain_deserializer = RunnableLambda(
-        lambda x: context_chain.invoke({
-            "user_input": x["user_input"],
-            "conversation": messages_from_dict(x.get("conversation", [])),
-        })
+        lambda x: context_chain.invoke(
+            {
+                "user_input": x["user_input"],
+                "conversation": messages_from_dict(x.get("conversation", [])),
+            },
+            config={
+                "metadata": {
+                    "langfuse_session_id": session_id,
+                    "langfuse_user_id": user_id,
+                },
+                "run_name": "context-with-metadata"
+            }
+        )
     )
 
     # RunnableRails calls context_chain_deserializer directly when input is not blocked,
@@ -378,7 +429,7 @@ def main():
             update_usage(ai_msg_with_tools)
 
             # Process tool calls and update Redis history
-            generate_context(ai_msg_with_tools, session_id)
+            generate_context(ai_msg_with_tools, session_id, user_id)
 
             # Update conversation after tools for the final response
             conversation = trimmer.invoke(get_history_messages(session_id))
