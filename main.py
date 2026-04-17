@@ -1,22 +1,21 @@
-import inspect
 import json
 import os
 import sys
 import uuid
-
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
-# Load environment variables from .env file
 dotenv.load_dotenv()
 
 users = ["James", "George", "Mike", "Sherlock"]
@@ -37,7 +36,6 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-conversation = []
 
 @observe(name="embed-documents")
 def embed_documents(json_path: str):
@@ -121,6 +119,7 @@ def embed_documents(json_path: str):
 
 product_db = embed_documents("datasets/smartphones.json")
 
+
 @tool("SmartphoneInfo")
 def smartphone_info_tool(model: str) -> str:
     """
@@ -143,49 +142,62 @@ def smartphone_info_tool(model: str) -> str:
     except Exception as e:
         return f"Error during smartphone information retrieval for model {model}: {e}"
 
+
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage, session_id: str) -> dict:
-    """
-    Process tool calls from the language model and collect their responses as ToolMessage objects.
+def generate_context(ai_message: AIMessage, session_id: str, user_input: str):
+    redis_history = get_redis_history(session_id)
+    redis_history.add_user_message(user_input)
+    redis_history.add_message(ai_message)
 
-    :param
-        ai_message (AIMessage): The language model's output message containing tool_calls.
+    if not ai_message.tool_calls:
+        return ai_message
 
-    :returns
-        A dictionary containing a list of ToolMessage objects under the key "tool_responses".
-    """
-    # construct the conversation history with the AI message containing tool calls
-    conversation.append(ai_message)
+    for tool_call in ai_message.tool_calls:
+        if tool_call["name"] == "SmartphoneInfo":
+            tool_output = smartphone_info_tool.invoke(tool_call)
+            redis_history.add_message(tool_output)
 
-    # Check if the AI message has any tool calls
-    if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
-
-    try:
-        for tool_call in ai_message.tool_calls:
-            if tool_call["name"] == "SmartphoneInfo":
-                tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
-
-    except Exception as e:
-        print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
-            AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
-            )
-        )
+    return ai_message
 
 
 langfuse_handler = CallbackHandler()
 
+REDIS_URL = "redis://localhost:6380/0"
+
+
+def get_redis_history(session_id: str) -> BaseChatMessageHistory:
+    return RedisChatMessageHistory(
+        session_id,
+        redis_url=REDIS_URL,
+        ttl=3600
+    )
+
+def print_redis_history(session_id: str):
+    history = get_redis_history(session_id)
+    messages = history.messages
+    print(f"\n--- Redis History ({len(messages)} messages) ---")
+    for i, msg in enumerate(messages):
+        print(f"[{i}] {type(msg).__name__}: {msg.content[:80] if msg.content else '(tool_calls only)'}")
+    print("---\n")
+
+def get_filtered_trimmed_history(session_id: str, max_messages: int = 20):
+    messages = get_redis_history(session_id).messages
+    if len(messages) > max_messages:
+        print(f"Info: Trimming history from {len(messages)} to {max_messages} messages.")
+        messages = messages[-max_messages:]
+
+    filtered = []
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            continue
+        if isinstance(msg, AIMessage) and msg.tool_calls and not msg.content:
+            continue
+        filtered.append(msg)
+    return filtered
+
 @observe(name="main")
 @propagate_attributes()
 def main():
-    # List of available tools
     session_id = f"session-{uuid.uuid4().hex[:8]}"
     langfuse_client = get_client()
     langfuse_client.update_current_span(
@@ -222,12 +234,11 @@ def main():
     llm_with_tools = llm.bind_tools(tools)
 
     def generate_context_with_session(ai_message: AIMessage):
-        return generate_context(ai_message, session_id)
-
-    context_chain = context_prompt | llm_with_tools | generate_context_with_session
-    review_chain = review_prompt | llm
+        return generate_context(ai_message, session_id, user_input)
 
     goodbye_chain = goodbye_prompt | llm
+    context_chain = context_prompt | llm_with_tools | generate_context_with_session
+    review_chain = review_prompt | llm
 
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
@@ -260,12 +271,11 @@ def main():
                 print("Thank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
-
             context_chain.invoke(
                 {
                     "user_input": user_input,
-                    "conversation": conversation},
+                    "conversation": get_filtered_trimmed_history(session_id)
+                },
                 config={
                     "run_name": "context",
                     "callbacks": [langfuse_handler],
@@ -280,7 +290,7 @@ def main():
                 {
                     "user_id": user_id,
                     "user_input": user_input,
-                    "conversation": conversation
+                    "conversation": get_filtered_trimmed_history(session_id)
                 },
                 config={
                     "run_name": "final-response",
@@ -291,10 +301,9 @@ def main():
                     }
                 }
             )
-
+            get_redis_history(session_id).add_message(response)
+            print_redis_history(session_id)
             print(f"System: {response.content}")
-            conversation.append(response)
-
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
         sys.exit(1)
