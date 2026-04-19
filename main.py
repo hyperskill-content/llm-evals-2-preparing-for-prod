@@ -5,14 +5,14 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import AIMessage
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import AIMessage, BaseMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableWithMessageHistory
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -36,6 +36,15 @@ llm = ChatOpenAI(
     api_key=os.getenv("OPENAI_API_KEY")
 )
 
+trimmer = trim_messages(
+    strategy="last",
+    token_counter=llm,
+    max_tokens=500,
+    start_on="human",
+    end_on=("human", "tool"),
+    include_system=True
+)
+
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
@@ -45,10 +54,10 @@ embeddings_model = OpenAIEmbeddings(
 )
 
 
-def get_redis_history() -> BaseChatMessageHistory:
+def get_redis_history(sid: str) -> BaseChatMessageHistory:
     return RedisChatMessageHistory(
-        session_id,
-        REDIS_URL,
+        session_id=sid,
+        redis_url=REDIS_URL,
         ttl=3600
     )
 
@@ -176,7 +185,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate-context")
-def generate_context(ai_message: AIMessage) -> AIMessage:
+def generate_context(ai_message: AIMessage) -> BaseMessage:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
 
@@ -184,7 +193,7 @@ def generate_context(ai_message: AIMessage) -> AIMessage:
         ai_message (AIMessage): The language model's output message containing tool_calls.
 
     :returns
-        An AIMessage containing the combined tool outputs.
+        A BaseMessage containing the combined tool outputs.
     """
     with propagate_attributes(
         trace_name="ai-response",
@@ -247,7 +256,7 @@ def main():
         goodbye_prompt_template = ChatPromptTemplate.from_messages(goodbye_prompt.get_langchain_prompt())
         goodbye_prompt_template.metadata = {"langfuse_prompt": goodbye_prompt}
 
-        context_chain = context_prompt_template | llm_with_tools | generate_context
+        context_chain = context_prompt_template | trimmer | llm_with_tools | generate_context
         context_chain_with_message_history = RunnableWithMessageHistory(
             runnable=context_chain,
             get_session_history=get_redis_history,
