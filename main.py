@@ -15,6 +15,8 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -44,6 +46,14 @@ trimmer = trim_messages(
     end_on=("human", "tool"),
     include_system=True
 )
+
+rails_config = RailsConfig.from_path("config")
+my_rails = RunnableRails(
+    config=rails_config,
+    input_key="user_input"
+)
+
+NEGATIVE_RESPONSE = "I'm sorry, I can't respond to that."
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
@@ -263,6 +273,7 @@ def main():
             input_messages_key="user_input",
             history_messages_key="conversation"
         )
+        context_chain_with_rails = my_rails | context_chain_with_message_history
 
         review_chain = review_prompt_template | llm
         review_chain_with_message_history = RunnableWithMessageHistory(
@@ -301,7 +312,7 @@ def main():
                     print(f"System: {goodbye_message.content}")
                     break
 
-                context_chain_with_message_history.invoke(
+                context_chain_response = context_chain_with_rails.invoke(
                     input={
                         "user_input": user_input
                     },
@@ -318,8 +329,12 @@ def main():
                     }
                 )
 
+                if (isinstance(context_chain_response, dict) and
+                        context_chain_response.get("output") == NEGATIVE_RESPONSE):
+                    print(f"System: {NEGATIVE_RESPONSE}")
+                    continue
 
-                response = review_chain_with_message_history.invoke(
+                review_chain_response = review_chain_with_message_history.invoke(
                     input={
                         "user_id": user_id,
                         "user_input": user_input
@@ -337,7 +352,7 @@ def main():
                     }
                 )
 
-                print(f"System: {response.content}")
+                print(f"System: {review_chain_response.content}")
 
         except Exception as e:
             print(f"An unexpected error occurred in the main loop: {e}")
