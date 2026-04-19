@@ -26,15 +26,16 @@ user_id = users[uuid.uuid4().int % len(users)]
 langfuse_client = get_client()
 
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": user_id}
 )
 
 embeddings_model = OpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDING_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True
 )
 
