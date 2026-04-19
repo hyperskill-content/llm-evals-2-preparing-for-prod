@@ -13,6 +13,8 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -154,8 +156,8 @@ def generate_context(ai_message: AIMessage, session_id: str, user_input: str):
 
     for tool_call in ai_message.tool_calls:
         if tool_call["name"] == "SmartphoneInfo":
-            tool_output = smartphone_info_tool.invoke(tool_call)
-            redis_history.add_message(tool_output)
+            tool_output = smartphone_info_tool.invoke(tool_call["args"])
+            redis_history.add_message(AIMessage(content=str(tool_output)))
 
     return ai_message
 
@@ -163,6 +165,7 @@ def generate_context(ai_message: AIMessage, session_id: str, user_input: str):
 langfuse_handler = CallbackHandler()
 
 REDIS_URL = "redis://localhost:6380/0"
+BLOCKED_MESSAGE = "I'm sorry, I can't respond to that."
 
 
 def get_redis_history(session_id: str) -> BaseChatMessageHistory:
@@ -198,7 +201,7 @@ def get_filtered_trimmed_history(session_id: str, max_messages: int = 20):
 @observe(name="main")
 @propagate_attributes()
 def main():
-    session_id = f"session-{uuid.uuid4().hex[:8]}"
+    session_id = f"session_{uuid.uuid4().hex[:8]}"
     langfuse_client = get_client()
     langfuse_client.update_current_span(
         name="ai-response",
@@ -234,7 +237,11 @@ def main():
     llm_with_tools = llm.bind_tools(tools)
 
     def generate_context_with_session(ai_message: AIMessage):
-        return generate_context(ai_message, session_id, user_input)
+        generate_context(ai_message, session_id, user_input)
+        return {"output": ai_message.content or ""}
+
+    rails_config = RailsConfig.from_path("config")
+    rails = RunnableRails(rails_config, input_key="user_input")
 
     goodbye_chain = goodbye_prompt | llm
     context_chain = context_prompt | llm_with_tools | generate_context_with_session
@@ -270,6 +277,11 @@ def main():
                 )
                 print("Thank you for your feedback!")
                 break
+
+            rails_check = rails.invoke({"input": user_input, "conversation": []})
+            if rails_check.get("output", "") == BLOCKED_MESSAGE:
+                print(f"System: {BLOCKED_MESSAGE}")
+                continue
 
             context_chain.invoke(
                 {
