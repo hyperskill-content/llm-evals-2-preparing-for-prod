@@ -11,3 +11,6 @@ langchain_qdrant
 requests
 langchain
 nemoguardrails
+langchain-redis
+litellm
+openai
