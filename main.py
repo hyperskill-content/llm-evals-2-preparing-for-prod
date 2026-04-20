@@ -79,29 +79,20 @@ class Agent:
         system_part = context_system_prompt.get_langchain_prompt()[0]
         user_part = context_system_prompt.get_langchain_prompt()[1]
         context_prompt = ChatPromptTemplate.from_messages(
-            [ system_part, MessagesPlaceholder(variable_name="conversation"), user_part ]
+            [ system_part, MessagesPlaceholder(variable_name="history"), user_part ]
         )
         context_prompt.metadata = {"langfuse_prompt": context_system_prompt}
 
         chain = context_prompt | self.trimmer | llm_with_tools | self.generate_context
 
-        # We manually add the user message to the chat history before invoking the chain.
-        # When passed as input_messages, it violates the AI message with tool calls followed by ToolMessages rule.
-        chat_history.add_user_message(HumanMessage(content=user_input))
-
-        # input_messages_key seems necessary, though, so we pass an empty list
-        chain_with_history = RunnableWithMessageHistory(
-            chain, get_redis_history, input_messages_key="empty_list", history_messages_key="conversation",
-        )
-        config = ConfigWithSession(
+        config = RunnableConfig(
             run_name="get_context",
             callbacks=[self.session.langfuse_handler],
             metadata={"langfuse_tags": ["dev", "test"]},
-            session_id=self.session.session_id
         )
 
-        return chain_with_history.invoke(
-            input={"user_input": user_input, "conversation": chat_history, "empty_list": []},
+        return chain.invoke(
+            input={"user_input": user_input, "history": chat_history.messages},
             config=config
         )
 
@@ -109,8 +100,7 @@ class Agent:
     def generate_context(self, ai_message: AIMessage) -> list[AIMessage]:
         """
         Process tool calls from the language model and collect their responses as AIMessage objects.
-        AIMessage objects are used as a workaround for the current limitations of the current
-        Redis-based chat history management.
+        This method does NOT store tool messages in the conversation history to keep the history clean.
 
         :param
             ai_message (AIMessage): The language model's output message containing tool_calls.
@@ -123,10 +113,8 @@ class Agent:
             return [AIMessage(content="Use the chat history to answer the user's question.")]
 
         try:
-            # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-            # a message with tool calls is expected to be followed by tool responses
-            chat_history = get_redis_history(self.session.session_id)
-            chat_history.add_message(ai_message)
+            # Process each tool call and invoke the appropriate tool
+            # Note: We do NOT add these to chat history to avoid polluting it with tool internals
             results = []
             for tool_call in ai_message.tool_calls:
                 if tool_call["name"] == "SmartphoneInfo":
@@ -142,8 +130,6 @@ class Agent:
     # Message Generation
     # ---------------------------
     def generate_review(self, user_input: str, chunks: list[str]) -> tuple[BaseMessage, asyncio.Task]:
-        chat_history = get_redis_history(self.session.session_id)
-
         with (self.session.langfuse_client.start_as_current_observation(
                 name="generate-review",
                 as_type="generation",
@@ -155,7 +141,7 @@ class Agent:
             review_prompt = ChatPromptTemplate.from_messages(
                 [
                     review_system_prompt.get_langchain_prompt()[0],
-                    MessagesPlaceholder(variable_name="conversation"),
+                    MessagesPlaceholder(variable_name="history"),
                     review_system_prompt.get_langchain_prompt()[1]
                 ]
             )
@@ -163,12 +149,11 @@ class Agent:
 
             review_chain = review_prompt | self.llm
             chain_with_history = RunnableWithMessageHistory(
-                review_chain, get_redis_history, input_messages_key="empty_list", history_messages_key="conversation",
+                review_chain, get_redis_history, input_messages_key="user_input", history_messages_key="history",
             )
 
             response = chain_with_history.invoke(
-                input={"user_id": self.session.user_id, "user_input": user_input, "conversation": chat_history,
-                       "empty_list": []},
+                input={"user_id": self.session.user_id, "user_input": user_input},
                 config=ConfigWithSession(
                     run_name="ai-response",
                     callbacks=[self.session.langfuse_handler],
