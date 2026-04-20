@@ -17,6 +17,7 @@ from langfuse import observe, get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from openai import AuthenticationError, BadRequestError
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -33,9 +34,10 @@ user_id = f"user-{uuid.uuid4().hex[:8]}"
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "Nush"}
 )
 
 trimmer = trim_messages(
@@ -353,7 +355,10 @@ def main():
                 )
 
                 print(f"System: {review_chain_response.content}")
-
+        except AuthenticationError as ae:
+            print(f"An authentication error occurred: {ae}")
+        except BadRequestError as bre:
+            print(f"A client-side error occurred: {bre}")
         except Exception as e:
             print(f"An unexpected error occurred in the main loop: {e}")
             sys.exit(1)
