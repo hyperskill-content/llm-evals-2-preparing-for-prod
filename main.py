@@ -1,11 +1,13 @@
 import json
 import os
 import sys
+import uuid
 import dotenv
 from langchain_community.docstore.document import Document
+from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -14,6 +16,10 @@ from langfuse import Langfuse
 from langfuse.decorators import langfuse_context, observe
 
 dotenv.load_dotenv()
+
+# redis runs on 6380 because 6379 is already used by langfuse
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING", "redis://localhost:6380/0")
+session_id = str(uuid.uuid4())
 
 langfuse = Langfuse(
     public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
@@ -37,18 +43,21 @@ embeddings_model = OpenAIEmbeddings(
 session_ending = False
 
 
+# returns a redis chat history for this session with a 1 hour ttl
+def get_chat_history():
+    return RedisChatMessageHistory(session_id, url=REDIS_URL, ttl=3600)
+
+
 # pulls the prompts from langfuse instead of hardcoding them
 def load_prompts():
     assistant_langfuse_prompt = langfuse.get_prompt("smartphone-assistant-prompt")
     final_langfuse_prompt = langfuse.get_prompt("smartphone-final-response-prompt")
 
-    # build prompt templates with a placeholder for chat history
     assistant_prompt = ChatPromptTemplate.from_messages([
         assistant_langfuse_prompt.get_langchain_prompt()[0],  # system message
         MessagesPlaceholder(variable_name="chat_history"),
         assistant_langfuse_prompt.get_langchain_prompt()[1],  # user message
     ])
-    # link prompt to langfuse so metrics show up per prompt in the ui
     assistant_prompt.metadata = {"langfuse_prompt": assistant_langfuse_prompt}
 
     final_prompt = ChatPromptTemplate.from_messages([
@@ -61,7 +70,6 @@ def load_prompts():
     return assistant_prompt, final_prompt
 
 
-# load smartphones from json and store in qdrant
 def embed_documents(json_path):
     try:
         with open(json_path, "r") as f:
@@ -203,14 +211,32 @@ def main():
     tools = [smartphone_info_tool, end_session_tool]
     llm_with_tools = llm.bind_tools(tools)
 
-    chat_history = []
+    # trim old messages so we don't send too many tokens each time
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=len,
+        max_tokens=10,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
+    )
+
+    context_chain = assistant_prompt | llm_with_tools | generate_context
+
+    # set up redis for chat history and clear it for a fresh session
+    chat_history = get_chat_history()
+    chat_history.clear()
 
     print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
 
     while True:
         user_input = input("User: ").strip()
 
-        context = get_context(assistant_prompt | llm_with_tools | generate_context, chat_history, user_input)
+        # load history from redis and trim it before sending to the llm
+        history = chat_history.messages
+        trimmed_history = trimmer.invoke(history) if history else []
+
+        context = get_context(context_chain, trimmed_history, user_input)
 
         if session_ending:
             trace_id = langfuse_context.get_current_trace_id()
@@ -228,10 +254,11 @@ def main():
             langfuse.flush()
             sys.exit(0)
 
-        response = get_final_response(final_prompt, chat_history, user_input, context)
+        response = get_final_response(final_prompt, trimmed_history, user_input, context)
 
-        chat_history.append(HumanMessage(content=user_input))
-        chat_history.append(AIMessage(content=response.content))
+        # save messages to redis
+        chat_history.add_message(HumanMessage(content=user_input))
+        chat_history.add_message(AIMessage(content=response.content))
 
         print(f"System: {response.content}")
 
