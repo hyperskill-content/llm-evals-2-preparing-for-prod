@@ -5,7 +5,7 @@ import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
@@ -21,14 +21,12 @@ langfuse = Langfuse(
     host=os.getenv("LANGFUSE_HOST"),
 )
 
-# Initialize the LLM
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL"),
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
-# Initialize the embeddings model
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
     base_url=os.getenv("OPENAI_BASE_URL"),
@@ -36,55 +34,40 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True,
 )
 
-# Global flag to signal session end
-_session_ending = False
+session_ending = False
 
-# ---------------------------
-# Load prompts from Langfuse
-# ---------------------------
+
+# pulls the prompts from langfuse instead of hardcoding them
 def load_prompts():
-    """Fetch managed prompts from Langfuse and build LangChain templates."""
-    lf_assistant = langfuse.get_prompt("smartphone-assistant-prompt")
-    lf_final = langfuse.get_prompt("smartphone-final-response-prompt")
+    assistant_langfuse_prompt = langfuse.get_prompt("smartphone-assistant-prompt")
+    final_langfuse_prompt = langfuse.get_prompt("smartphone-final-response-prompt")
 
-    # Context/tool-routing prompt: system + chat history + user message
-    assistant_prompt = ChatPromptTemplate.from_messages(
-        [
-            lf_assistant.get_langchain_prompt()[0],          # system
-            MessagesPlaceholder(variable_name="chat_history"),
-            lf_assistant.get_langchain_prompt()[1],          # user: "You have been asked: {{user_input}}"
-        ]
-    )
-    # Link the Langfuse prompt so metrics appear in the UI
-    assistant_prompt.metadata = {"langfuse_prompt": lf_assistant}
+    # build prompt templates with a placeholder for chat history
+    assistant_prompt = ChatPromptTemplate.from_messages([
+        assistant_langfuse_prompt.get_langchain_prompt()[0],  # system message
+        MessagesPlaceholder(variable_name="chat_history"),
+        assistant_langfuse_prompt.get_langchain_prompt()[1],  # user message
+    ])
+    # link prompt to langfuse so metrics show up per prompt in the ui
+    assistant_prompt.metadata = {"langfuse_prompt": assistant_langfuse_prompt}
 
-    # Final response prompt: system + context + user query
-    final_prompt = ChatPromptTemplate.from_messages(
-        [
-            lf_final.get_langchain_prompt()[0],              # system
-            MessagesPlaceholder(variable_name="chat_history"),
-            lf_final.get_langchain_prompt()[1],              # user: "User query / Context"
-        ]
-    )
-    final_prompt.metadata = {"langfuse_prompt": lf_final}
+    final_prompt = ChatPromptTemplate.from_messages([
+        final_langfuse_prompt.get_langchain_prompt()[0],
+        MessagesPlaceholder(variable_name="chat_history"),
+        final_langfuse_prompt.get_langchain_prompt()[1],
+    ])
+    final_prompt.metadata = {"langfuse_prompt": final_langfuse_prompt}
 
-    return assistant_prompt, final_prompt, lf_assistant, lf_final
+    return assistant_prompt, final_prompt
 
-# ---------------------------
-# Load JSON Data and Build Qdrant Vector Store
-# ---------------------------
-def embed_documents(json_path: str):
+
+# load smartphones from json and store in qdrant
+def embed_documents(json_path):
     try:
         with open(json_path, "r") as f:
             data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: The file {json_path} was not found.")
-        return []
-    except json.JSONDecodeError as jde:
-        print(f"Error decoding JSON: {jde}")
-        return []
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Error loading data: {e}")
         return []
 
     documents = []
@@ -126,12 +109,9 @@ def embed_documents(json_path: str):
         print(f"Error initializing vector store: {e}")
         return []
 
-# ---------------------------
-# Tool Definitions
-# ---------------------------
 
 @observe(name="SmartphoneInfo")
-def _get_smartphone_info(model: str) -> str:
+def _get_smartphone_info(model):
     results = product_db.similarity_search(model, k=1)
     if not results:
         return "Could not find information for the specified model."
@@ -148,56 +128,51 @@ def smartphone_info_tool(model: str) -> str:
     try:
         return _get_smartphone_info(model)
     except Exception as e:
-        return f"Error during smartphone information retrieval: {e}"
+        return f"Error retrieving smartphone info: {e}"
 
 
 @tool("EndSession")
 def end_session_tool(session_status: str):
     """Ends the current session when the user is done."""
-    global _session_ending
-    _session_ending = True
-    prompt = (
-        "You are an AI assistant specialized in answering questions about smartphone features. "
-        "Provide a polite goodbye message and thank the user for their feedback."
-    )
+    global session_ending
+    session_ending = True
     try:
-        goodbye_message = llm.invoke(prompt).content
-        print(goodbye_message)
+        goodbye = llm.invoke(
+            "You are an AI assistant for smartphones. Write a short polite goodbye message."
+        ).content
+        print(goodbye)
     except Exception:
         print("Thank you for visiting. Goodbye!")
     print("\nRate the model's responses from 1 to 5 (3 being average):")
     return "Session ended."
 
-# ---------------------------
-# Observed helper functions
-# ---------------------------
 
 @observe(name="generate_context")
-def generate_context(llm_tools):
-    generated_context = []
-    for tool_call in llm_tools.tool_calls:
+def generate_context(llm_response):
+    context = []
+    for tool_call in llm_response.tool_calls:
         if tool_call["name"] == "SmartphoneInfo":
-            tool_response = smartphone_info_tool.invoke(tool_call)
-            generated_context.append(tool_response)
+            result = smartphone_info_tool.invoke(tool_call)
+            context.append(result)
         elif tool_call["name"] == "EndSession":
             end_session_tool.invoke(tool_call)
         else:
-            generated_context.append("No tool found for this query.")
+            context.append("No tool found for this query.")
             sys.exit(0)
     langfuse_context.update_current_observation(
-        input=str(llm_tools.tool_calls),
-        output=str(generated_context),
-        metadata={"tool_calls": len(llm_tools.tool_calls)},
+        input=str(llm_response.tool_calls),
+        output=str(context),
+        metadata={"tool_calls": len(llm_response.tool_calls)},
     )
-    return generated_context
+    return context
 
 
 @observe(name="context")
-def get_context(prompt, llm_with_tools, chat_history, user_input):
-    chain = prompt | llm_with_tools | generate_context
-    result = chain.invoke({"chat_history": chat_history, "user_input": user_input})
+def get_context(context_chain, chat_history, user_input):
+    result = context_chain.invoke({"chat_history": chat_history, "user_input": user_input})
     langfuse_context.update_current_observation(
-        input=user_input, output=str(result), metadata={"chat_history_length": len(chat_history)}
+        input=user_input, output=str(result),
+        metadata={"chat_history_length": len(chat_history)}
     )
     return result
 
@@ -212,40 +187,33 @@ def get_final_response(final_prompt, chat_history, user_input, context):
         })
     )
     langfuse_context.update_current_observation(
-        input=user_input, output=response.content, metadata={"model": os.getenv("OPENAI_MODEL")}
+        input=user_input, output=response.content,
+        metadata={"model": os.getenv("OPENAI_MODEL")}
     )
     return response
 
-# ---------------------------
-# Main Conversation Loop
-# ---------------------------
 
 @observe(name="main")
 def main():
-    global _session_ending
-    _session_ending = False
+    global session_ending
+    session_ending = False
 
-    # Load managed prompts from Langfuse
-    assistant_prompt, final_prompt, lf_assistant, lf_final = load_prompts()
+    assistant_prompt, final_prompt = load_prompts()
 
     tools = [smartphone_info_tool, end_session_tool]
     llm_with_tools = llm.bind_tools(tools)
 
     chat_history = []
-    last_question = ""
-    last_answer = ""
-    last_contexts = []
 
     print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
 
     while True:
         user_input = input("User: ").strip()
 
-        context = get_context(assistant_prompt, llm_with_tools, chat_history, user_input)
+        context = get_context(assistant_prompt | llm_with_tools | generate_context, chat_history, user_input)
 
-        if _session_ending:
+        if session_ending:
             trace_id = langfuse_context.get_current_trace_id()
-
             rating_str = input("User: ").strip()
             try:
                 rating = float(rating_str)
@@ -253,7 +221,6 @@ def main():
                 rating = 3.0
             print("Please give us a reason for your answer:")
             comment = input("User: ").strip()
-
             langfuse.score(
                 trace_id=trace_id, name="usefulness", value=rating,
                 comment=comment, data_type="NUMERIC",
@@ -262,13 +229,6 @@ def main():
             sys.exit(0)
 
         response = get_final_response(final_prompt, chat_history, user_input, context)
-        last_question = user_input
-        last_answer = response.content
-
-        if isinstance(context, list):
-            last_contexts = [c.content if hasattr(c, "content") else str(c) for c in context]
-        else:
-            last_contexts = [str(context)]
 
         chat_history.append(HumanMessage(content=user_input))
         chat_history.append(AIMessage(content=response.content))
