@@ -8,8 +8,11 @@ from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, trim_messages
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import Langfuse
@@ -17,7 +20,7 @@ from langfuse.decorators import langfuse_context, observe
 
 dotenv.load_dotenv()
 
-# redis runs on 6380 because 6379 is already used by langfuse
+# redis runs on 6380 because 6379 is taken by langfuse
 REDIS_URL = os.getenv("REDIS_CONNECTION_STRING", "redis://localhost:6380/0")
 session_id = str(uuid.uuid4())
 
@@ -41,9 +44,10 @@ embeddings_model = OpenAIEmbeddings(
 )
 
 session_ending = False
+blocked_message = "I'm sorry, I can't respond to that."
 
 
-# returns a redis chat history for this session with a 1 hour ttl
+# returns a fresh redis chat history for this session with a 1 hour ttl
 def get_chat_history():
     return RedisChatMessageHistory(session_id, url=REDIS_URL, ttl=3600)
 
@@ -53,11 +57,13 @@ def load_prompts():
     assistant_langfuse_prompt = langfuse.get_prompt("smartphone-assistant-prompt")
     final_langfuse_prompt = langfuse.get_prompt("smartphone-final-response-prompt")
 
+    # build the assistant prompt template with a placeholder for chat history
     assistant_prompt = ChatPromptTemplate.from_messages([
         assistant_langfuse_prompt.get_langchain_prompt()[0],  # system message
         MessagesPlaceholder(variable_name="chat_history"),
         assistant_langfuse_prompt.get_langchain_prompt()[1],  # user message
     ])
+    # link the prompt to langfuse so we can see metrics per prompt
     assistant_prompt.metadata = {"langfuse_prompt": assistant_langfuse_prompt}
 
     final_prompt = ChatPromptTemplate.from_messages([
@@ -70,6 +76,7 @@ def load_prompts():
     return assistant_prompt, final_prompt
 
 
+# load smartphones from json and store them in qdrant
 def embed_documents(json_path):
     try:
         with open(json_path, "r") as f:
@@ -221,9 +228,17 @@ def main():
         include_system=True,
     )
 
+    # set up guardrails to check input before running the chain
+    rails_config = RailsConfig.from_path("./config")
+    input_checker = RunnableRails(
+        rails_config,
+        runnable=RunnableLambda(lambda x: {"output": "allowed"}),
+        input_key="user_input",
+    )
+
     context_chain = assistant_prompt | llm_with_tools | generate_context
 
-    # set up redis for chat history and clear it for a fresh session
+    # set up redis chat history and clear it for a fresh session
     chat_history = get_chat_history()
     chat_history.clear()
 
@@ -232,9 +247,15 @@ def main():
     while True:
         user_input = input("User: ").strip()
 
-        # load history from redis and trim it before sending to the llm
+        # trim history to avoid token limit issues
         history = chat_history.messages
         trimmed_history = trimmer.invoke(history) if history else []
+
+        # check with guardrails first - if blocked skip the llm call entirely
+        guard_result = input_checker.invoke({"user_input": user_input})
+        if isinstance(guard_result, dict) and guard_result.get("output") == blocked_message:
+            print(f"System: {blocked_message}")
+            continue
 
         context = get_context(context_chain, trimmed_history, user_input)
 
@@ -256,7 +277,7 @@ def main():
 
         response = get_final_response(final_prompt, trimmed_history, user_input, context)
 
-        # save messages to redis
+        # save the messages to redis
         chat_history.add_message(HumanMessage(content=user_input))
         chat_history.add_message(AIMessage(content=response.content))
 
