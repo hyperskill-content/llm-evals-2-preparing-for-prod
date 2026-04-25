@@ -30,16 +30,19 @@ langfuse = Langfuse(
     host=os.getenv("LANGFUSE_HOST"),
 )
 
+# route through litellm proxy instead of calling openai directly
+# model_kwargs passes the user so litellm can track budgets per user
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "HyperUser"},
 )
 
 embeddings_model = OpenAIEmbeddings(
     model="text-embedding-ada-002",
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True,
 )
 
@@ -203,7 +206,7 @@ def get_final_response(final_prompt, chat_history, user_input, context):
     )
     langfuse_context.update_current_observation(
         input=user_input, output=response.content,
-        metadata={"model": os.getenv("OPENAI_MODEL")}
+        metadata={"model": os.getenv("LITELLM_MODEL")}
     )
     return response
 
