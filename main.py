@@ -9,6 +9,8 @@ from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.messages import trim_messages
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_redis import RedisChatMessageHistory
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 
 load_dotenv()
 
@@ -24,6 +26,13 @@ with open(os.path.join(os.path.dirname(__file__), "datasets", "smartphones.json"
     smartphones_data = json.load(f)
 
 smartphones_context = json.dumps(smartphones_data[:20], indent=2)  # limit context size
+
+# Guardrails configuration
+guardrails_config = RailsConfig.from_path(
+    os.path.join(os.path.dirname(__file__), "config")
+)
+
+BLOCKED_RESPONSE = "I'm sorry, I can't respond to that."
 
 
 def get_llm():
@@ -79,6 +88,18 @@ def get_chain_with_history():
 
 def chat(user_input: str, session_id: str = "default_session"):
     """Process a user message and return the assistant's response."""
+    # Apply guardrails to check input
+    rails = RunnableRails(guardrails_config, input_key="user_input")
+    context_chain = get_llm()  # simple LLM call for guardrails check
+    chain_with_rails = rails | context_chain
+
+    rail_response = chain_with_rails.invoke({"user_input": user_input})
+
+    # Check if the input rail was triggered
+    if BLOCKED_RESPONSE in rail_response.content:
+        return BLOCKED_RESPONSE
+
+    # Input passed guardrails, proceed with the full chain
     chain = get_chain_with_history()
     response = chain.invoke(
         {"user_input": user_input, "context": smartphones_context},
@@ -93,14 +114,16 @@ def main():
     print("-" * 40)
 
     session_id = "hyperskill_user"
+    total_usage = 0.0
 
     while True:
-        user_input = input("\nYou: ").strip()
+        user_input = input("\nUser: ").strip()
         if user_input.lower() in ("quit", "exit", "q"):
             break
 
         response = chat(user_input, session_id)
-        print(f"\nAssistant: {response}")
+        print(f"System: {response}")
+        print(f"Your usage so far: {total_usage}")
 
 
 if __name__ == "__main__":
