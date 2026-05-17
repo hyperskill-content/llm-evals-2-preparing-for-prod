@@ -88,12 +88,12 @@ def get_chain_with_history():
 
 def chat(user_input: str, session_id: str = "default_session"):
     """Process a user message and return the assistant's response."""
-    # Apply guardrails to check input
-    rails = RunnableRails(guardrails_config, input_key="user_input")
-    context_chain = get_llm()  # simple LLM call for guardrails check
-    chain_with_rails = rails | context_chain
+    # Apply guardrails to check input via context chain
+    llm = get_llm()
+    rails = RunnableRails(guardrails_config, input_key="user_input", output_key="output")
+    context_chain_with_rails = rails | llm
 
-    rail_response = chain_with_rails.invoke({"user_input": user_input})
+    rail_response = context_chain_with_rails.invoke({"user_input": user_input})
 
     # Check if the input rail was triggered
     if BLOCKED_RESPONSE in rail_response.content:
