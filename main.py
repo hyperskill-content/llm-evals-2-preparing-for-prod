@@ -5,12 +5,19 @@ from dotenv import load_dotenv
 from langfuse import Langfuse
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.messages import trim_messages
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_redis import RedisChatMessageHistory
 
 load_dotenv()
 
 # Initialize Langfuse client
 langfuse_client = Langfuse()
+
+# Redis configuration
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING", "redis://localhost:6380/0")
+CHAT_HISTORY_TTL = int(os.getenv("CHAT_HISTORY_TTL", "3600"))  # 1 hour default
 
 # Load smartphone data
 with open(os.path.join(os.path.dirname(__file__), "datasets", "smartphones.json")) as f:
@@ -27,9 +34,13 @@ def get_llm():
     )
 
 
-def get_chain():
-    """Build the chain using prompts fetched from Langfuse."""
-    # Fetch prompt from Langfuse instead of hard-coding
+def get_redis_history(session_id: str) -> BaseChatMessageHistory:
+    """Return a Redis-backed chat history for the given session."""
+    return RedisChatMessageHistory(session_id, redis_url=REDIS_URL, ttl=CHAT_HISTORY_TTL)
+
+
+def get_chain_with_history():
+    """Build the chain with Redis message history and trimming."""
     smartphone_prompt = langfuse_client.get_prompt("smartphone-assistant")
 
     prompt = ChatPromptTemplate.from_messages(
@@ -40,25 +51,39 @@ def get_chain():
         ]
     )
 
-    # Link prompt to Langfuse observations for metrics tracking
     prompt.metadata = {"langfuse_prompt": smartphone_prompt}
 
     llm = get_llm()
-    chain = prompt | llm
-    return chain
+
+    # Trimmer to prevent chat history from growing too long
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=len,  # approximate: count by number of messages
+        max_tokens=20,  # keep last 20 messages max
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
+    )
+
+    chain = prompt | trimmer | llm
+
+    chain_with_history = RunnableWithMessageHistory(
+        chain,
+        get_redis_history,
+        input_messages_key="user_input",
+        history_messages_key="chat_history",
+    )
+
+    return chain_with_history
 
 
-def chat(user_input: str, chat_history: list = None):
+def chat(user_input: str, session_id: str = "default_session"):
     """Process a user message and return the assistant's response."""
-    if chat_history is None:
-        chat_history = []
-
-    chain = get_chain()
-    response = chain.invoke({
-        "user_input": user_input,
-        "chat_history": chat_history,
-        "context": smartphones_context,
-    })
+    chain = get_chain_with_history()
+    response = chain.invoke(
+        {"user_input": user_input, "context": smartphones_context},
+        config={"configurable": {"session_id": session_id}},
+    )
     return response.content
 
 
@@ -67,18 +92,15 @@ def main():
     print("Smartphone Info Bot (type 'quit' to exit)")
     print("-" * 40)
 
-    chat_history = []
+    session_id = "hyperskill_user"
 
     while True:
         user_input = input("\nYou: ").strip()
         if user_input.lower() in ("quit", "exit", "q"):
             break
 
-        response = chat(user_input, chat_history)
+        response = chat(user_input, session_id)
         print(f"\nAssistant: {response}")
-
-        chat_history.append(HumanMessage(content=user_input))
-        chat_history.append(AIMessage(content=response))
 
 
 if __name__ == "__main__":
