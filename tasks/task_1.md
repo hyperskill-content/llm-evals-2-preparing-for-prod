@@ -18,7 +18,7 @@ Before you get that near-perfect prompt for your LLMs, you will have created and
 
 When refining prompts, hard-coded prompts in your application will be difficult to deal with. Will you have to redeploy your application whenever you make the slightest change to your prompts? How do you know how your prompts have evolved? How do you roll back to previous prompts that worked better? You need a better way to manage and version your prompts.
 
-Well, you can treat your prompts the same way you treat code. That is, use Git to store and version your prompts as JSON/YAML files. You can also use a managed platform such as your monitoring solution if it provides this functionality. Luckily, Langfuse, our monitoring solution, allows us to create, test, rollback, and manage prompts effortlessly. If you are using another solution like [LangSmith](https://docs.smith.langchain.com/prompt_engineering/how_to_guides/manage_prompts_programatically) or [Portkey](https://portkey.ai/docs/product/prompt-engineering-studio/prompt-versioning), they also provide this functionality.
+Well, you can treat your prompts the same way you treat code. That is, use Git to store and version your prompts as JSON/YAML files. You can also use a managed platform such as your monitoring solution if it provides this functionality. Luckily, Langfuse, our monitoring solution, allows us to create, test, rollback, and manage prompts effortlessly. If you are using another solution like [LangSmith](https://docs.langchain.com/langsmith/manage-prompts-programmatically) or [Portkey](https://portkey.ai/docs/product/prompt-engineering-studio/prompt-versioning), they also provide this functionality.
 
 ---
 
@@ -33,9 +33,9 @@ Managing prompts in Langfuse is straightforward. You create prompts via the UI o
 Now, all you need to do is retrieve that prompt and use it:
 
 ```python
-from langfuse import Langfuse
+from langfuse import get_client
 
-langfuse_client = Langfuse()
+langfuse_client = get_client()
 
 hello_prompt = langfuse_client.get_prompt("hello-world")
 print(hello_prompt.prompt)
@@ -47,6 +47,8 @@ print(hello_prompt.prompt)
 Since we selected the type of prompt as “Chat”, Langfuse returns it in the proper format for Chat completion APIs. In some cases, however, you need to convert the prompt to a proper format, such as when using LangChain’s `ChatPromptTemplate`. You can do that using `.get_langchain_prompt()`:
 
 ```python
+from langchain_core.prompts import ChatPromptTemplate
+
 hello_prompt = langfuse_client.get_prompt("hello-world")
 prompt = ChatPromptTemplate.from_messages(
     hello_prompt.get_langchain_prompt(),
@@ -58,9 +60,9 @@ You can also create text prompts and retrieve them the same way. When using `Mes
 ```python
 prompt = ChatPromptTemplate.from_messages(
    [
-      hello_prompt.get_langchain_prompt()[0], # system message
+      hello_prompt.get_langchain_prompt()[0], # system message is indexed with 0
       MessagesPlaceholder(variable_name="chat_history"), # for the chat history
-      hello_prompt.get_langchain_prompt()[1], # user message
+      hello_prompt.get_langchain_prompt()[1], # user message is indexed with 1
    ]
 )
 ```
@@ -73,7 +75,7 @@ Here is how you can do that for the LangChain prompt we created above:
 prompt.metadata={"langfuse_prompt": hello_prompt}
 ```
 
-You should now see metrics associated with that prompt in the Langfuse UI:
+You should now see metrics associated with that prompt in the Langfuse UI under the 'Metrics' tab:
 
 ![Prompt Linked to observations in Langfuse UI](../assets/images/prompt_links.png)
 
@@ -83,7 +85,14 @@ You should now see metrics associated with that prompt in the Langfuse UI:
 
 ### Development Steps
 
-Move prompts to Langfuse and refactor the code to use these prompts. Ensure that the application continues to function in the same way. Since we are also tracking metrics related to each prompt, ensure to add the metadata field for each prompt. You should now see metrics in Langfuse. You can also easily run experiments and test these prompts from the Langfuse UI to ensure you have the best versions. Here are some examples:
+Move prompts to Langfuse and refactor the code to use these prompts (use the starter code in [main.py](../main.py)). Ensure that the application continues to function in the same way. Make sure to give the following names to the prompts: 
+```python
+context_system_prompt
+review_system_prompt
+goodbye_system_prompt
+```
+
+Since we are also tracking metrics related to each prompt, ensure to add the metadata field for each prompt. You should now see metrics in Langfuse. You can also easily run experiments and test these prompts from the Langfuse UI to ensure you have the best versions. Here are some examples:
 
 Example 1: *Sample prompts and their linked observations in Langfuse UI*:
 

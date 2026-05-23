@@ -42,35 +42,35 @@ You will also need the appropriate libraries to interact with Redis:
 pip install langchain-redis redis
 ```
 
-To store message history in Redis for your LangChain apps, you use the [RedisChatMessageHistory](https://python.langchain.com/api_reference/redis/chat_message_history/langchain_redis.chat_message_history.RedisChatMessageHistory.html) class. Simply import the class and initialize chat history as follows:
+To store message history in Redis for your LangChain apps, you use the [RedisChatMessageHistory](https://reference.langchain.com/python/langchain-redis/chat_message_history/RedisChatMessageHistory) class. Simply import the class and initialize chat history as follows:
 
 ```python
 from langchain_redis import RedisChatMessageHistory
 
 REDIS_URL = "redis://localhost:6380/0"
 
-chat_history = RedisChatMessageHistory(session_id="hyper, redis_url=REDIS_URL)
+history = RedisChatMessageHistory(session_id = "your-session-id", redis_url=REDIS_URL)
 ```
 
 Next, you can add messages:
 
 ```python
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-system_prompt = "You are a helpful assistant..."
+system_prompt = "You are a helpful assistant."
 
 user_input = input().strip()
 
-chat_history.add_message(SystemMessage(content=system_prompt)) # to add a system message (you may not need to add this to the chat history)
-chat_history.add_message(HumanMessage(content=user_input)) # to add a user's input
+history.add_message(SystemMessage(content=system_prompt)) # to add a system message (you may not need to add this to the chat history)
+history.add_message(HumanMessage(content=user_input)) # to add a user's input
 response = llm.invoke(....)
-chat_history.add_ai_message(AIMessage(content=response.content)) # to add an AI response
+history.add_message(AIMessage(content=response.content)) # to add an AI response
 ```
 
 You can then retrieve the messages as follows:
 
 ```python
-for message in chat_history.messages:
-    print(f"{message['type']}: {message.content}")
+for message in history.messages:
+    print(f"{message.type}: {message.content}")
     
 # output
 SystemMessage: You are a helpful assistant. 
@@ -81,9 +81,9 @@ AIMessage: Hello! I can assist you with smartphone recommendations
 You could even search for specific messages in the chat history. This is particularly useful when you need to only send a subset of messages to the LLM rather than the entire chat history to save costs. You can search for a message as follows:
 
 ```python
-search_results = chat_history.search_messages("smartphone")
+search_results = history.search_messages("smartphone")
 for result in search_results:
-    print(f"{result['type']}: {result.content[:10]}")
+    print(f"{result['type']}: {result['content'][:10]}")   
     
 # Output
 HumanMessage: I need help ordering a smartphone.
@@ -93,7 +93,7 @@ AIMessage: Hello! I can assist you with smartphone recommendations
 To prevent the chat history from getting too long, you can clear it periodically (for example, via a helper function that deletes messages older than five days):
 
 ```python
-chat_history.clear()
+history.clear()
 ```
 
 If you are using LangChain chains, LangChain makes it even easier to manage chat history. You can just do it like before, only this time we’ll be using Redis rather than a local variable:
@@ -125,7 +125,7 @@ Then, combine your chain with the chat history using the `RunnableWithMessageHis
 from langchain_core.runnables.history import RunnableWithMessageHistory
 chain = prompt | llm
 chain_with_message_history = RunnableWithMessageHistory(
-    chain, get_redis_history, input_messages_key="user_input", history_messages_key="chat_history"
+    chain, get_redis_history, input_messages_key="user_input", history_messages_key="conversation"
 )
 ```
 
@@ -133,14 +133,14 @@ Finally, invoke it:
 
 ```python
 response = chain_with_message_history.invoke(
-    {"input": "Hey. I'm from New York."},
+    {"user_input": "Hey. I'm from New York."},
     config={"configurable": {"session_id": "hyperskill_user"}},
 )
-print(response.content) 
+print(response.content)
 # Hey! Nice to meet you—New York is ...
 
 response_from_history = chain_with_message_history.invoke(
-    {"input": "Where did I say I was from?"},
+    {"user_input": "Where did I say I was from?"},
     config={"configurable": {"session_id": "hyperskill_user"}},
 )
 print(response_from_history.content)
@@ -198,8 +198,8 @@ Since we are using chains, you can connect the chain to the message history. Thi
 ###### **Docs**
 
 - [Getting started with Redis](https://redis.io/docs/latest/get-started/).
-- [Redis Chat Message history](https://python.langchain.com/docs/integrations/memory/redis_chat_message_history/).
-- [How to trim messages](https://python.langchain.com/docs/how_to/trim_messages/).
+- [Redis Chat Message history](https://reference.langchain.com/python/langchain-redis/chat_message_history/RedisChatMessageHistory).
+- [How to trim messages](https://reference.langchain.com/python/langchain-core/messages/utils/trim_messages).
 
 ---
 
