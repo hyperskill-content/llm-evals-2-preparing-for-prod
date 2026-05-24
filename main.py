@@ -6,15 +6,16 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, \
+    PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -25,19 +26,13 @@ users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
-)
+llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL"),
+    base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize the embeddings model with OpenAI API credentials
-embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-    show_progress_bar=True
-)
+embeddings_model = OpenAIEmbeddings(model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
+    base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"),
+    show_progress_bar=True)
 
 # Initialize conversation history
 conversation = []
@@ -77,41 +72,33 @@ def embed_documents(json_path: str):
     documents = []
     for entry in data:
         # Build a readable content string from the JSON entry
-        content = (
-            f"Model: {entry.get('model', '')}\n"
-            f"Price: {entry.get('price', '')}\n"
-            f"Rating: {entry.get('rating', '')}\n"
-            f"SIM: {entry.get('sim', '')}\n"
-            f"Processor: {entry.get('processor', '')}\n"
-            f"RAM: {entry.get('ram', '')}\n"
-            f"Battery: {entry.get('battery', '')}\n"
-            f"Display: {entry.get('display', '')}\n"
-            f"Camera: {entry.get('camera', '')}\n"
-            f"Card: {entry.get('card', '')}\n"
-            f"OS: {entry.get('os', '')}\n"
-            f"In Stock: {entry.get('in_stock', '')}"
-        )
+        content = (f"Model: {entry.get('model', '')}\n"
+                   f"Price: {entry.get('price', '')}\n"
+                   f"Rating: {entry.get('rating', '')}\n"
+                   f"SIM: {entry.get('sim', '')}\n"
+                   f"Processor: {entry.get('processor', '')}\n"
+                   f"RAM: {entry.get('ram', '')}\n"
+                   f"Battery: {entry.get('battery', '')}\n"
+                   f"Display: {entry.get('display', '')}\n"
+                   f"Camera: {entry.get('camera', '')}\n"
+                   f"Card: {entry.get('card', '')}\n"
+                   f"OS: {entry.get('os', '')}\n"
+                   f"In Stock: {entry.get('in_stock', '')}")
         documents.append(Document(page_content=content))
 
     try:
         collection_name = "smartphones"
         qdrant_client = QdrantClient("http://localhost:6333")
 
-        collection_exists = qdrant_client.collection_exists(collection_name=collection_name)
+        collection_exists = qdrant_client.collection_exists(
+            collection_name=collection_name)
         if not collection_exists:
-            qdrant_client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=1536,
-                    distance=Distance.COSINE,
-                ),
-            )
+            qdrant_client.create_collection(collection_name=collection_name,
+                vectors_config=VectorParams(size=1536,
+                    distance=Distance.COSINE, ), )
 
-            qdrant_store = QdrantVectorStore(
-                client=qdrant_client,
-                collection_name=collection_name,
-                embedding=embeddings_model
-            )
+            qdrant_store = QdrantVectorStore(client=qdrant_client,
+                collection_name=collection_name, embedding=embeddings_model)
 
             qdrant_store.add_documents(documents=documents)
 
@@ -120,9 +107,7 @@ def embed_documents(json_path: str):
         # no need to create a vector store every time
         else:
             qdrant_store = QdrantVectorStore.from_existing_collection(
-                embedding=embeddings_model,
-                collection_name=collection_name,
-            )
+                embedding=embeddings_model, collection_name=collection_name, )
 
             return qdrant_store
 
@@ -180,11 +165,8 @@ def generate_context(ai_message: AIMessage) -> dict:
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
+        conversation.append(AIMessage(
+            content="No tool calls found. Please ensure the model is configured to use tools."))
 
     try:
         # Process each tool call, invoke the appropriate tool, and append the result to the conversation
@@ -196,11 +178,8 @@ def generate_context(ai_message: AIMessage) -> dict:
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
-            AIMessage(
-                content=f"An error occurred while processing tool calls: {e}"
-            )
-        )
+        conversation.append(AIMessage(
+            content=f"An error occurred while processing tool calls: {e}"))
 
 
 # ---------------------------
@@ -213,58 +192,24 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_system_prompt = """
-        You're part of a smartphone recommendation system. Your work is to use the SmartphoneInfo tool to retrieve information about smartphones based on user queries.
-          - If the user requests specs/comparisons/recommendations for a model explicitly mentioned in chat or can be inferred from the conversation history, call SmartphoneInfo(model)
-          - If multiple models are mentioned or from the conversation history, you must call SmartphoneInfo for each model separately.
-          - If the user asks a general question, do nothing.
-        Do not guess or recommend a model from internal knowledge; the model name must be clear from the chat history or user input.
-
-        Current question: {user_input}
-    """
-
-    review_system_prompt = """
-        You are an expert AI assistant helping customers pick the best smartphone from our catalog. Follow these rules strictly:
-
-        1. Focus solely on concise (under 100 words), human-like, personalized reviews/comparisons of models named in the user's query or provided context.
-        2. Think step by step before answering.
-        3. Never guess or recommend any model not explicitly mentioned in the context or query.
-        4. If no model is given, ask the user to check our online catalog for the exact model name.
-        5. DO NOT assist with ordering, returns, tracking, or other general support.
-        6. If asked about anything outside smartphone features/comparisons, respond that you can't help.
-        7. If the user only wants to chat, engage briefly, but always steer back to smartphone comparisons.
-        8. Never list smartphone specifications, but instead explain how they translate to real-world benefits.
-
-        When recommending, evaluate performance, display, battery, camera, and special functions (e.g., 5G, fast charging, expandable storage), and how they translate to real-world benefits.
-        Always confirm the user's needs before finalizing.
-
-        Current user: {user_id}
-        Current question: {user_input}
-    """
-
-    goodbye_system_prompt = """
-        You have been helping the user: {user_id} with smartphone features and comparisons.
-        Generate a short friendly goodbye message for the user and also thank them for their feedback.
-        (note that you've already been helping the user with smartphone features and comparisons, so do not repeat that or greet them again)
-    """
-
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt",
+                                            type="chat")
     context_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(context_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
+        [context_lf_prompt.get_langchain_prompt()[0],
+            MessagesPlaceholder("conversation")])
+    context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
     review_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(review_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
+        [review_lf_prompt.get_langchain_prompt()[0],
+            MessagesPlaceholder("conversation")])
+    review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
+    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt",
+                                            type="text")
     goodbye_prompt = PromptTemplate.from_template(
-        goodbye_system_prompt
-    )
+        goodbye_lf_prompt.get_langchain_prompt())
+    goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
     context_chain = context_prompt | llm_with_tools | generate_context
     review_chain = review_prompt | llm
@@ -275,45 +220,39 @@ def main():
     langfuse_handler = CallbackHandler()
 
     try:
-        print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
+        print(
+            "Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
-                with langfuse.start_as_current_observation(
-                    as_type="span",
-                    name="user-query",
-                    input={"user_input": user_input}
-                ) as span:
-                    with propagate_attributes(
-                        session_id=session_id,
-                        user_id=user_id
-                    ):
+                with langfuse.start_as_current_observation(as_type="span",
+                        name="user-query",
+                        input={"user_input": user_input}) as span:
+                    with propagate_attributes(session_id=session_id,
+                            user_id=user_id):
                         goodbye_message = goodbye_chain.invoke(
                             {"user_id": user_id},
-                            config={
-                                "run_name": "goodbye-message",
-                                "callbacks": [langfuse_handler]
-                            }
-                        )
+                            config={"run_name": "goodbye-message",
+                                "callbacks": [langfuse_handler]})
 
                         # Set the output on the parent span
-                        span.update(output={"response": goodbye_message.content})
+                        span.update(
+                            output={"response": goodbye_message.content})
 
                 print(f"System: {goodbye_message.content}")
 
                 # Collect user feedback about the entire conversation
-                feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
-                user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
+                feedback = input(
+                    "\nWas this conversation helpful? (Yes/No): ").strip()
+                user_comment = input(
+                    "Please give us a reason for your answer. This will help us improve: ").strip()
 
                 # Score at the session level (not individual trace)
-                langfuse.create_score(
-                    session_id=session_id,  # Use the session_id from the start of the conversation
-                    name="conversation_usefulness",
-                    value=feedback,
-                    data_type="CATEGORICAL",
-                    comment=user_comment
-                )
+                langfuse.create_score(session_id=session_id,
+                    # Use the session_id from the start of the conversation
+                    name="conversation_usefulness", value=feedback,
+                    data_type="CATEGORICAL", comment=user_comment)
 
                 print("\nThank you for your feedback!")
                 break
@@ -321,33 +260,24 @@ def main():
             conversation.append(HumanMessage(user_input))
 
             # Create a parent span for this user query to group all chain invocations
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="user-query",
-                input={"user_input": user_input}
-            ) as span:
+            with langfuse.start_as_current_observation(as_type="span",
+                    name="user-query",
+                    input={"user_input": user_input}) as span:
                 # Propagate trace attributes to all child observations
-                with propagate_attributes(
-                    session_id=session_id,
-                    user_id=user_id
-                ):
+                with propagate_attributes(session_id=session_id,
+                        user_id=user_id):
                     # Context chain invocation
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "context",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+                    context_chain.invoke({"user_input": user_input,
+                                          "conversation": conversation},
+                        config={"run_name": "context",
+                            "callbacks": [langfuse_handler]})
 
                     # Final response chain invocation
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "final-response",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+                        {"user_id": user_id, "user_input": user_input,
+                         "conversation": conversation},
+                        config={"run_name": "final-response",
+                            "callbacks": [langfuse_handler]})
 
                 # Set the output on the parent span
                 span.update(output={"response": response.content})
