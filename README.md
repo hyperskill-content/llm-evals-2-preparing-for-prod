@@ -24,6 +24,111 @@ By focusing on these production-oriented patterns, we are building a resilient a
 
 ---
 
+## **Setup**
+
+This project uses [uv](https://docs.astral.sh/uv/) for Python package management. Follow these steps to get started:
+
+### Prerequisites
+
+1. Install uv:
+   ```bash
+   # On macOS and Linux
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+
+   # On Windows
+   powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. Verify installation:
+   ```bash
+   uv --version
+   ```
+
+### Installation
+
+1. Clone the repository:
+   ```bash
+   git clone <repository-url>
+   cd llm-evals-2-preparing-for-prod
+   ```
+
+2. Install dependencies using `uv`:
+   ```bash
+   uv sync
+   ```
+
+   This will:
+   - Create a virtual environment in `.venv/`
+   - Install all dependencies from `pyproject.toml`
+   - Generate/update the `uv.lock` file for reproducible builds
+
+3. Set up environment variables:
+   ```bash
+   cp .env.sample .env
+   # Edit .env with your API keys and configuration
+   ```
+
+### Running the Application
+
+```bash
+uv run python main.py
+```
+
+If your IDE (VS Code, PyCharm) isn't recognizing the environment or you need to use tools that aren't uv-aware, activate the virtual environment manually:
+```bash
+source .venv/bin/activate  # On macOS/Linux
+# or
+.venv\Scripts\activate  # On Windows
+
+# Run the application
+python main.py
+```
+
+### Adding New Dependencies
+
+To add new packages to the project:
+
+```bash
+uv add <package-name>
+```
+
+For development dependencies:
+
+```bash
+uv add --dev <package-name>
+```
+
+### Managing Environment Variables
+
+When adding new environment variables to your project:
+
+1. **Always update `.env.sample`** with the new variable names (without actual values):
+   ```bash
+   # Example: Adding a new service
+   NEW_SERVICE_API_KEY="<your-api-key-here>"
+   NEW_SERVICE_BASE_URL="<service-url>"
+   ```
+
+2. **Do not remove `.env.sample`** - This file serves as a template for other developers and documents all required environment variables for the project.
+
+3. **Add descriptive comments** in `.env.sample` to explain what each variable is used for, especially if it's not immediately obvious.
+
+### Documenting Code Structure Changes
+
+If you modify the default application structure or change how the application runs:
+
+1. **Update this README** with the new run instructions in the "Running the Application" section above.
+
+2. **Document any new directories or files** in the "Project Structure" section.
+
+3. **Explain the reasoning** for structural changes in your Pull Request description so reviewers understand the architectural decisions.
+
+Examples of changes that require documentation updates:
+- Moving code from `main.py` into modular files under `src/`
+- Introducing new entry points (e.g., `app.py`, `cli.py`)
+- Adding configuration files or changing how configuration is loaded
+- Creating new directories for components, utilities, or services       
+
 ## **Learning Outcomes**
 
 By the end of this project, you will have transformed the functional chatbot prototype into a production-ready application. You'll implement key operational patterns that ensure reliability and control. This project will equip you with the skills to build LLM applications that are secure and efficient — ready to handle real-world deployment challenges.
