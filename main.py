@@ -7,11 +7,13 @@ import uuid
 import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, \
-    PromptTemplate
+from langchain_core.messages import trim_messages
+from langchain_core.prompts import (MessagesPlaceholder, ChatPromptTemplate,
+                                    PromptTemplate)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
@@ -27,15 +29,19 @@ user_id = users[uuid.uuid4().int % len(users)]
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"))
+                 base_url=os.getenv("OPENAI_BASE_URL"),
+                 api_key=os.getenv("OPENAI_API_KEY"))
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"), api_key=os.getenv("OPENAI_API_KEY"),
-    show_progress_bar=True)
+                                    base_url=os.getenv("OPENAI_BASE_URL"),
+                                    api_key=os.getenv("OPENAI_API_KEY"),
+                                    show_progress_bar=True)
 
 # Initialize conversation history
-conversation = []
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING")
+history = RedisChatMessageHistory(session_id=session_id, redis_url=REDIS_URL,
+                                  ttl=3600)
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -94,11 +100,13 @@ def embed_documents(json_path: str):
             collection_name=collection_name)
         if not collection_exists:
             qdrant_client.create_collection(collection_name=collection_name,
-                vectors_config=VectorParams(size=1536,
-                    distance=Distance.COSINE, ), )
+                                            vectors_config=VectorParams(
+                                                size=1536,
+                                                distance=Distance.COSINE, ), )
 
             qdrant_store = QdrantVectorStore(client=qdrant_client,
-                collection_name=collection_name, embedding=embeddings_model)
+                                             collection_name=collection_name,
+                                             embedding=embeddings_model)
 
             qdrant_store.add_documents(documents=documents)
 
@@ -150,7 +158,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage, conversation: list) -> None:
     """
     Process tool calls from the language model and collect their responses as ToolMessage objects.
 
@@ -158,7 +166,7 @@ def generate_context(ai_message: AIMessage) -> dict:
         ai_message (AIMessage): The language model's output message containing tool_calls.
 
     :returns
-        A dictionary containing a list of ToolMessage objects under the key "tool_responses".
+        None.  Mutates the conversation list in place.
     """
     # construct the conversation history with the AI message containing tool calls
     conversation.append(ai_message)
@@ -182,6 +190,10 @@ def generate_context(ai_message: AIMessage) -> dict:
             content=f"An error occurred while processing tool calls: {e}"))
 
 
+trimmer = trim_messages(strategy="last", token_counter=llm, max_tokens=500,
+    start_on="human", end_on=("human", "tool"), include_system=True)
+
+
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
@@ -196,13 +208,13 @@ def main():
                                             type="chat")
     context_prompt = ChatPromptTemplate.from_messages(
         [context_lf_prompt.get_langchain_prompt()[0],
-            MessagesPlaceholder("conversation")])
+         MessagesPlaceholder("conversation")])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
     review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
     review_prompt = ChatPromptTemplate.from_messages(
         [review_lf_prompt.get_langchain_prompt()[0],
-            MessagesPlaceholder("conversation")])
+         MessagesPlaceholder("conversation")])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
     goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt",
@@ -211,7 +223,7 @@ def main():
         goodbye_lf_prompt.get_langchain_prompt())
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
@@ -223,18 +235,20 @@ def main():
         print(
             "Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
+            conversation = list(history.messages)
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
                 with langfuse.start_as_current_observation(as_type="span",
-                        name="user-query",
-                        input={"user_input": user_input}) as span:
+                                                           name="user-query",
+                                                           input={
+                                                               "user_input": user_input}) as span:
                     with propagate_attributes(session_id=session_id,
-                            user_id=user_id):
+                                              user_id=user_id):
                         goodbye_message = goodbye_chain.invoke(
                             {"user_id": user_id},
                             config={"run_name": "goodbye-message",
-                                "callbacks": [langfuse_handler]})
+                                    "callbacks": [langfuse_handler]})
 
                         # Set the output on the parent span
                         span.update(
@@ -250,40 +264,48 @@ def main():
 
                 # Score at the session level (not individual trace)
                 langfuse.create_score(session_id=session_id,
-                    # Use the session_id from the start of the conversation
-                    name="conversation_usefulness", value=feedback,
-                    data_type="CATEGORICAL", comment=user_comment)
+                                      # Use the session_id from the start of the conversation
+                                      name="conversation_usefulness",
+                                      value=feedback, data_type="CATEGORICAL",
+                                      comment=user_comment)
 
                 print("\nThank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            user_message = HumanMessage(content=user_input)
+            conversation.append(user_message)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(as_type="span",
-                    name="user-query",
-                    input={"user_input": user_input}) as span:
+                                                       name="user-query",
+                                                       input={
+                                                           "user_input": user_input}) as span:
                 # Propagate trace attributes to all child observations
                 with propagate_attributes(session_id=session_id,
-                        user_id=user_id):
+                                          user_id=user_id):
                     # Context chain invocation
-                    context_chain.invoke({"user_input": user_input,
-                                          "conversation": conversation},
+                    trimmed_conversation = trimmer.invoke(conversation)
+                    ai_message = context_chain.invoke(
+                        {"user_input": user_input,
+                         "conversation": trimmed_conversation},
                         config={"run_name": "context",
-                            "callbacks": [langfuse_handler]})
+                                "callbacks": [langfuse_handler]})
+                    generate_context(ai_message, conversation)
 
                     # Final response chain invocation
                     response = review_chain.invoke(
                         {"user_id": user_id, "user_input": user_input,
                          "conversation": conversation},
                         config={"run_name": "final-response",
-                            "callbacks": [langfuse_handler]})
+                                "callbacks": [langfuse_handler]})
 
                 # Set the output on the parent span
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
-            conversation.append(response)
+
+            history.add_message(user_message)
+            history.add_message(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
