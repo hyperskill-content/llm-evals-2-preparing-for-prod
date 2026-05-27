@@ -18,9 +18,21 @@ from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
+from langchain_core.globals import set_debug
+
+set_debug(False)
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+# Load guardrails configuration
+config = RailsConfig.from_path("config/")
+
+# Create guardrails instance for input validation only
+input_rails = RunnableRails(config, input_key="user_input")
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
@@ -94,7 +106,7 @@ def embed_documents(json_path: str):
 
     try:
         collection_name = "smartphones"
-        qdrant_client = QdrantClient("http://localhost:6333")
+        qdrant_client = QdrantClient("http://127.0.0.1:6333")
 
         collection_exists = qdrant_client.collection_exists(
             collection_name=collection_name)
@@ -237,6 +249,23 @@ def main():
         while True:
             conversation = list(history.messages)
             user_input = input("User: ").strip()
+
+            user_message = HumanMessage(content=user_input)
+            conversation.append(user_message)
+
+            validation_result = input_rails.rails.generate(
+                messages=[{"role": "user", "content": user_input}],
+                options=GenerationOptions(output_vars=True),
+            )
+            validation_context = validation_result.output_data or {}
+            rail_triggered = (
+                validation_context.get("allowed") is False or
+                bool(validation_context.get("triggered_input_rail"))
+            )
+
+            if rail_triggered:
+                print(f"System: {validation_context.get('bot_message')}")
+                continue
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
                 with langfuse.start_as_current_observation(as_type="span",
@@ -271,9 +300,6 @@ def main():
 
                 print("\nThank you for your feedback!")
                 break
-
-            user_message = HumanMessage(content=user_input)
-            conversation.append(user_message)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(as_type="span",
