@@ -6,6 +6,7 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
+from langchain_core.globals import set_debug
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.messages import trim_messages
 from langchain_core.prompts import (MessagesPlaceholder, ChatPromptTemplate,
@@ -16,12 +17,11 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from nemoguardrails.rails.llm.options import GenerationOptions
-from langchain_core.globals import set_debug
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
 
 set_debug(False)
 
@@ -42,7 +42,8 @@ user_id = users[uuid.uuid4().int % len(users)]
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL"),
                  base_url=os.getenv("OPENAI_BASE_URL"),
-                 api_key=os.getenv("OPENAI_API_KEY"))
+                 api_key=os.getenv("OPENAI_API_KEY"),
+                 model_kwargs={"user": "hyper-user"})
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
@@ -203,7 +204,8 @@ def generate_context(ai_message: AIMessage, conversation: list) -> None:
 
 
 trimmer = trim_messages(strategy="last", token_counter=llm, max_tokens=500,
-    start_on="human", end_on=("human", "tool"), include_system=True)
+                        start_on="human", end_on=("human", "tool"),
+                        include_system=True)
 
 
 # ---------------------------
@@ -255,17 +257,13 @@ def main():
 
             validation_result = input_rails.rails.generate(
                 messages=[{"role": "user", "content": user_input}],
-                options=GenerationOptions(
-                    rails=["input"],
+                options=GenerationOptions(rails=["input"],
                     output_vars=["allowed", "triggered_input_rail",
-                                 "bot_message"],
-                ),
-            )
+                                 "bot_message"], ), )
             validation_context = validation_result.output_data or {}
             rail_triggered = (
-                validation_context.get("allowed") is False or
-                bool(validation_context.get("triggered_input_rail"))
-            )
+                    validation_context.get("allowed") is False or bool(
+                validation_context.get("triggered_input_rail")))
 
             if rail_triggered:
                 print(f"System: {validation_context.get('bot_message')}")

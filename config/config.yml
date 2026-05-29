@@ -4,7 +4,8 @@ models:
     model: gpt-4o-mini
     api_key_env_var: OPENAI_API_KEY
     parameters:
-      base_url: https://litellm.aks-hs-prod.int.hyperskill.org/openai
+      base_url: http://127.0.0.1:4000/v1
+      user: hyper-user
 
 rails:
   input:
