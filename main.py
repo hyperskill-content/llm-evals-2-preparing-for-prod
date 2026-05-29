@@ -255,7 +255,11 @@ def main():
 
             validation_result = input_rails.rails.generate(
                 messages=[{"role": "user", "content": user_input}],
-                options=GenerationOptions(output_vars=True),
+                options=GenerationOptions(
+                    rails=["input"],
+                    output_vars=["allowed", "triggered_input_rail",
+                                 "bot_message"],
+                ),
             )
             validation_context = validation_result.output_data or {}
             rail_triggered = (
