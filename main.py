@@ -16,6 +16,13 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+
+# Canonical refusal text emitted by NeMo's `self_check_input` flow when the
+# rail blocks. The current RunnableRails API returns a dict (no metadata
+# flag), so we detect blocking by matching this exact string.
+INPUT_RAIL_REFUSAL = "I'm sorry, I can't respond to that."
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -258,6 +265,19 @@ def main():
         ttl=3600,
     )
 
+    # Input guardrails validate user messages before any chain runs.
+    # Use a dedicated, stricter model (gpt-4) for the self_check_input rail
+    # because lighter models (gpt-4o-mini) under-trigger on borderline cases.
+    # We pass the LLM explicitly so NeMo reuses our base_url/api_key instead
+    # of building its own client (which would hit api.openai.com).
+    rail_llm = ChatOpenAI(
+        model="gpt-4",
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    rails_config = RailsConfig.from_path("config/")
+    input_rails = RunnableRails(rails_config, llm=rail_llm, input_key="user_input")
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
@@ -318,6 +338,30 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    # Validate input BEFORE invoking expensive chains
+                    validation_result = input_rails.invoke(
+                        {"user_input": user_input},
+                        config={
+                            "run_name": "input-validation",
+                            "callbacks": [langfuse_handler]
+                        }
+                    )
+
+                    rail_output = (
+                        validation_result.get("output", "")
+                        if isinstance(validation_result, dict)
+                        else getattr(validation_result, "content", "")
+                    )
+                    rail_triggered = rail_output.strip() == INPUT_RAIL_REFUSAL
+
+                    if rail_triggered:
+                        span.update(output={
+                            "response": rail_output,
+                            "rail_triggered": True,
+                        })
+                        print(f"System: {rail_output}")
+                        continue
+
                     # Context chain invocation
                     ai_with_tools = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
