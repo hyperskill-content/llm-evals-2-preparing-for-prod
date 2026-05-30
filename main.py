@@ -6,15 +6,23 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+
+# Canonical refusal text emitted by NeMo's `self_check_input` flow when the
+# rail blocks. The current RunnableRails API returns a dict (no metadata
+# flag), so we detect blocking by matching this exact string.
+INPUT_RAIL_REFUSAL = "I'm sorry, I can't respond to that."
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -38,9 +46,6 @@ embeddings_model = OpenAIEmbeddings(
     api_key=os.getenv("OPENAI_API_KEY"),
     show_progress_bar=True
 )
-
-# Initialize conversation history
-conversation = []
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -165,15 +170,13 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> dict:
+def generate_context(ai_message: AIMessage, conversation: list) -> None:
     """
-    Process tool calls from the language model and collect their responses as ToolMessage objects.
+    Process tool calls from the language model and append their responses to the conversation list.
 
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
-
-    :returns
-        A dictionary containing a list of ToolMessage objects under the key "tool_responses".
+        conversation (list): The in-memory message list for the current turn; mutated in place.
     """
     # construct the conversation history with the AI message containing tool calls
     conversation.append(ai_message)
@@ -213,66 +216,67 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_system_prompt = """
-        You're part of a smartphone recommendation system. Your work is to use the SmartphoneInfo tool to retrieve information about smartphones based on user queries.
-          - If the user requests specs/comparisons/recommendations for a model explicitly mentioned in chat or can be inferred from the conversation history, call SmartphoneInfo(model)
-          - If multiple models are mentioned or from the conversation history, you must call SmartphoneInfo for each model separately.
-          - If the user asks a general question, do nothing.
-        Do not guess or recommend a model from internal knowledge; the model name must be clear from the chat history or user input.
-
-        Current question: {user_input}
-    """
-
-    review_system_prompt = """
-        You are an expert AI assistant helping customers pick the best smartphone from our catalog. Follow these rules strictly:
-
-        1. Focus solely on concise (under 100 words), human-like, personalized reviews/comparisons of models named in the user's query or provided context.
-        2. Think step by step before answering.
-        3. Never guess or recommend any model not explicitly mentioned in the context or query.
-        4. If no model is given, ask the user to check our online catalog for the exact model name.
-        5. DO NOT assist with ordering, returns, tracking, or other general support.
-        6. If asked about anything outside smartphone features/comparisons, respond that you can't help.
-        7. If the user only wants to chat, engage briefly, but always steer back to smartphone comparisons.
-        8. Never list smartphone specifications, but instead explain how they translate to real-world benefits.
-
-        When recommending, evaluate performance, display, battery, camera, and special functions (e.g., 5G, fast charging, expandable storage), and how they translate to real-world benefits.
-        Always confirm the user's needs before finalizing.
-
-        Current user: {user_id}
-        Current question: {user_input}
-    """
-
-    goodbye_system_prompt = """
-        You have been helping the user: {user_id} with smartphone features and comparisons.
-        Generate a short friendly goodbye message for the user and also thank them for their feedback.
-        (note that you've already been helping the user with smartphone features and comparisons, so do not repeat that or greet them again)
-    """
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
 
     context_prompt = ChatPromptTemplate.from_messages(
         [
-            (SystemMessage(context_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
+            context_lf_prompt.get_langchain_prompt()[0],
+            MessagesPlaceholder(variable_name="conversation"),
         ]
     )
+    context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
     review_prompt = ChatPromptTemplate.from_messages(
         [
-            (SystemMessage(review_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
+            review_lf_prompt.get_langchain_prompt()[0],
+            MessagesPlaceholder(variable_name="conversation"),
         ]
     )
+    review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
     goodbye_prompt = PromptTemplate.from_template(
-        goodbye_system_prompt
+        goodbye_lf_prompt.get_langchain_prompt()
+    )
+    goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
+
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=llm,
+        max_tokens=500,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
     )
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | trimmer | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
 
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
+
+    # Persist chat history in Redis with a 1h TTL so it auto-expires
+    redis_history = RedisChatMessageHistory(
+        session_id=session_id,
+        redis_url=os.getenv("REDIS_URL"),
+        ttl=3600,
+    )
+
+    # Input guardrails validate user messages before any chain runs.
+    # Use a dedicated, stricter model (gpt-4) for the self_check_input rail
+    # because lighter models (gpt-4o-mini) under-trigger on borderline cases.
+    # We pass the LLM explicitly so NeMo reuses our base_url/api_key instead
+    # of building its own client (which would hit api.openai.com).
+    rail_llm = ChatOpenAI(
+        model="gpt-4",
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    rails_config = RailsConfig.from_path("config/")
+    input_rails = RunnableRails(rails_config, llm=rail_llm, input_key="user_input")
 
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
@@ -318,7 +322,10 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            # Load prior turns from Redis; tool calls stay in-memory only
+            conversation = list(redis_history.messages)
+            user_message = HumanMessage(user_input)
+            conversation.append(user_message)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
@@ -331,14 +338,40 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    # Validate input BEFORE invoking expensive chains
+                    validation_result = input_rails.invoke(
+                        {"user_input": user_input},
+                        config={
+                            "run_name": "input-validation",
+                            "callbacks": [langfuse_handler]
+                        }
+                    )
+
+                    rail_output = (
+                        validation_result.get("output", "")
+                        if isinstance(validation_result, dict)
+                        else getattr(validation_result, "content", "")
+                    )
+                    rail_triggered = rail_output.strip() == INPUT_RAIL_REFUSAL
+
+                    if rail_triggered:
+                        span.update(output={
+                            "response": rail_output,
+                            "rail_triggered": True,
+                        })
+                        print(f"System: {rail_output}")
+                        continue
+
                     # Context chain invocation
-                    context_chain.invoke(
+                    ai_with_tools = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
                         }
                     )
+
+                    generate_context(ai_with_tools, conversation)
 
                     # Final response chain invocation
                     response = review_chain.invoke(
@@ -353,7 +386,10 @@ def main():
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
-            conversation.append(response)
+
+            # Persist only the clean turn boundary (user input + final response)
+            redis_history.add_message(user_message)
+            redis_history.add_message(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
