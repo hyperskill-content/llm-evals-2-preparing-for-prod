@@ -21,3 +21,8 @@ dependencies = [
 
 [dependency-groups]
 dev = []
+
+[tool.uv]
+required-environments = [
+	"sys_platform == 'darwin' and platform_machine == 'x86_64'"
+]

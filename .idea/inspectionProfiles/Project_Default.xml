@@ -1,0 +1,27 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="hs-test-python" />
+          <option value="chromadb" />
+          <option value="langchain-chroma" />
+          <option value="langchain-community" />
+          <option value="langchain-core" />
+          <option value="langchain-openai" />
+          <option value="langchain-groq" />
+          <option value="python-dotenv" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyStringConversionWithoutDunderMethodInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="reportedTypes">
+        <list>
+          <option value="types.FunctionType" />
+          <option value="type" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
