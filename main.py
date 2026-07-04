@@ -15,6 +15,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from langchain_redis import RedisChatMessageHistory
+from langchain_core.messages import trim_messages
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -39,8 +41,24 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
+# Initialize Redis history with TTL and trimmer
+redis_history = RedisChatMessageHistory(
+    session_id=session_id,
+    redis_url=os.getenv("REDIS_CONNECTION_STRING"),
+    ttl=3600
+)
+
+trimmer = trim_messages(
+    strategy="last",
+    token_counter=llm,
+    max_tokens=500,
+    start_on="human",
+    end_on=("human", "tool"),
+    include_system=True,
+)
+
 # Initialize conversation history
-conversation = []
+conversation = list(redis_history.messages)
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -231,7 +249,7 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | trimmer | llm_with_tools | generate_context
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
@@ -243,6 +261,7 @@ def main():
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
+            redis_history.add_message(HumanMessage(content=user_input))
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
                 with langfuse.start_as_current_observation(
@@ -266,6 +285,7 @@ def main():
                         span.update(output={"response": goodbye_message.content})
 
                 print(f"System: {goodbye_message.content}")
+                redis_history.add_message(AIMessage(content=goodbye_message.content))
 
                 # Collect user feedback about the entire conversation
                 feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
@@ -281,6 +301,18 @@ def main():
                 )
 
                 print("\nThank you for your feedback!")
+
+                ### What's in history?
+                print("### What's in history?")
+                messages = redis_history.messages
+                for message in messages:
+                    print(f"{message.type}: {message.content}")
+
+                ### What's in conversation?
+                print("### What's in conversation?")
+                for message in conversation:
+                    print(f"{message.type}: {message.content}")
+
                 break
 
             conversation.append(HumanMessage(user_input))
@@ -318,6 +350,7 @@ def main():
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
+            redis_history.add_message(AIMessage(content=response.content))
             conversation.append(response)
 
     except Exception as e:
