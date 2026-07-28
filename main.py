@@ -33,9 +33,10 @@ user_id = users[uuid.uuid4().int % len(users)]
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL"),
+    base_url="http://0.0.0.0:4000/",
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": "HyperUser"},
 )
 
 # Initialize the embeddings model with OpenAI API credentials
