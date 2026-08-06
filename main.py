@@ -21,7 +21,7 @@ from langchain_core.messages import trim_messages
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
-REDIS_URL = "redis://localhost:6380/0"
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING")
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
@@ -193,11 +193,6 @@ def generate_context(ai_message: AIMessage, conversation: list) -> dict:
                 tool_output = smartphone_info_tool.invoke(tool_call)
                 conversation.append(tool_output)
 
-        return {
-            "ai_message": ai_message,
-            "conversation": conversation
-        }
-
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
         conversation.append(
@@ -205,7 +200,6 @@ def generate_context(ai_message: AIMessage, conversation: list) -> dict:
                 content=f"An error occurred while processing tool calls: {e}"
             )
         )
-        return {}
 
 
 # ---------------------------
@@ -219,33 +213,29 @@ def main():
         ttl=3600  # 1 hour
     )
 
-    conversation = list(redis_history.messages)
-
     # List of available tools
     tools = [smartphone_info_tool]
 
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt", type="chat")
     context_prompt = ChatPromptTemplate.from_messages([
         context_lf_prompt.get_langchain_prompt()[0],
-        context_lf_prompt.get_langchain_prompt()[1],
         MessagesPlaceholder("conversation"),
     ])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
-    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
     review_prompt = ChatPromptTemplate.from_messages([
         review_lf_prompt.get_langchain_prompt()[0],
-        context_lf_prompt.get_langchain_prompt()[1],
         MessagesPlaceholder("conversation"),
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
-    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
-    goodbye_prompt = PromptTemplate.from_template(
-        goodbye_lf_prompt.get_langchain_prompt()[0][1]
+    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt", type="chat")
+    goodbye_prompt = ChatPromptTemplate.from_messages(
+        goodbye_lf_prompt.get_langchain_prompt()
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
@@ -271,29 +261,6 @@ def main():
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
-                # Create a parent span for the goodbye message
-                with langfuse.start_as_current_observation(
-                    as_type="span",
-                    name="user-query",
-                    input={"user_input": user_input}
-                ) as span:
-                    with propagate_attributes(
-                        session_id=session_id,
-                        user_id=user_id
-                    ):
-                        goodbye_message = goodbye_chain.invoke(
-                            {"user_id": user_id},
-                            config={
-                                "run_name": "goodbye-message",
-                                "callbacks": [langfuse_handler]
-                            }
-                        )
-
-                        # Set the output on the parent span
-                        span.update(output={"response": goodbye_message.content})
-
-                print(f"System: {goodbye_message.content}")
-
                 # Collect user feedback about the entire conversation
                 feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
                 user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
@@ -307,8 +274,31 @@ def main():
                     comment=user_comment
                 )
 
-                print("\nThank you for your feedback!")
+                # Create a parent span for the goodbye message
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query",
+                    input={"user_input": user_input}
+                ) as span:
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        goodbye_message = goodbye_chain.invoke(
+                            {"user_id": user_id, "user_input": user_input},
+                            config={
+                                "run_name": "goodbye-message",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
+
+                        # Set the output on the parent span
+                        span.update(output={"response": goodbye_message.content})
+
+                print(f"System: {goodbye_message.content}")
                 break
+
+            conversation = list(redis_history.messages)
 
             human_message = HumanMessage(user_input)
             redis_history.add_message(human_message)
