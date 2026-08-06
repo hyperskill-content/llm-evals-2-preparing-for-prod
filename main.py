@@ -21,10 +21,12 @@ from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from nemoguardrails.rails.llm.options import GenerationOptions
 
-# Load environment variables from .env file
-dotenv.load_dotenv()
+dotenv.load_dotenv(override=True)
 
-REDIS_URL = "redis://localhost:6380/0"
+REDIS_URL = os.getenv("REDIS_CONNECTION_STRING")
+LITELLM_MODEL = os.getenv("LITELLM_MODEL")
+LITELLM_BASE_URL = os.getenv("LITELLM_BASE_URL")
+LITELLM_API_KEY = os.getenv("LITELLM_API_KEY")
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
@@ -33,17 +35,17 @@ user_id = users[uuid.uuid4().int % len(users)]
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("LITELLM_MODEL"),
-    base_url="http://0.0.0.0:4000/",
-    api_key=os.getenv("LITELLM_API_KEY"),
+    model=LITELLM_MODEL,
+    base_url=LITELLM_BASE_URL,
+    api_key=LITELLM_API_KEY,
     model_kwargs={"user": "HyperUser"},
 )
 
-# Initialize the embeddings model with OpenAI API credentials
+# Route embeddings through the LiteLLM proxy.
 embeddings_model = OpenAIEmbeddings(
     model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=LITELLM_BASE_URL,
+    api_key=LITELLM_API_KEY,
     show_progress_bar=True
 )
 
@@ -170,7 +172,7 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage, conversation: list) -> dict:
+def generate_context(ai_message: AIMessage, conversation: list) -> None:
     """
     Process tool calls from the language model and append the AI message and
     each tool's response as ToolMessage objects to the conversation history.
@@ -197,11 +199,6 @@ def generate_context(ai_message: AIMessage, conversation: list) -> dict:
                 tool_output = smartphone_info_tool.invoke(tool_call)
                 conversation.append(tool_output)
 
-        return {
-            "ai_message": ai_message,
-            "conversation": conversation
-        }
-
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
         conversation.append(
@@ -209,22 +206,20 @@ def generate_context(ai_message: AIMessage, conversation: list) -> dict:
                 content=f"An error occurred while processing tool calls: {e}"
             )
         )
-        return {}
 
 
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
 def main():
-    base_url = os.environ.get("OPENAI_BASE_URL")
-
-    if not base_url:
-        raise RuntimeError("OPENAI_BASE_URL is not set")
     # Load guardrails configuration
     config = RailsConfig.from_path("config/")
-    for model in config.models:
-        if model.type == "main":
-            model.parameters["base_url"] = base_url
+    for rails_model in config.models:
+        if rails_model.type == "main":
+            rails_model.model = LITELLM_MODEL
+            rails_model.parameters["base_url"] = LITELLM_BASE_URL
+            rails_model.parameters["api_key"] = LITELLM_API_KEY
+            rails_model.parameters["user"] = "HyperUser"
 
     # Create guardrails instance for input validation only
     input_rails = RunnableRails(config, input_key="user_input")
@@ -236,33 +231,29 @@ def main():
         ttl=3600  # 1 hour
     )
 
-    conversation = list(redis_history.messages)
-
     # List of available tools
     tools = [smartphone_info_tool]
 
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt", type="chat")
     context_prompt = ChatPromptTemplate.from_messages([
         context_lf_prompt.get_langchain_prompt()[0],
-        context_lf_prompt.get_langchain_prompt()[1],
         MessagesPlaceholder("conversation"),
     ])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
-    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
     review_prompt = ChatPromptTemplate.from_messages([
         review_lf_prompt.get_langchain_prompt()[0],
-        context_lf_prompt.get_langchain_prompt()[1],
         MessagesPlaceholder("conversation"),
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
-    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
-    goodbye_prompt = PromptTemplate.from_template(
-        goodbye_lf_prompt.get_langchain_prompt()[0][1]
+    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt", type="chat")
+    goodbye_prompt = ChatPromptTemplate.from_messages(
+        goodbye_lf_prompt.get_langchain_prompt()
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
@@ -288,29 +279,6 @@ def main():
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
-                # Create a parent span for the goodbye message
-                with langfuse.start_as_current_observation(
-                    as_type="span",
-                    name="user-query",
-                    input={"user_input": user_input}
-                ) as span:
-                    with propagate_attributes(
-                        session_id=session_id,
-                        user_id=user_id
-                    ):
-                        goodbye_message = goodbye_chain.invoke(
-                            {"user_id": user_id},
-                            config={
-                                "run_name": "goodbye-message",
-                                "callbacks": [langfuse_handler]
-                            }
-                        )
-
-                        # Set the output on the parent span
-                        span.update(output={"response": goodbye_message.content})
-
-                print(f"System: {goodbye_message.content}")
-
                 # Collect user feedback about the entire conversation
                 feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
                 user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
@@ -324,9 +292,32 @@ def main():
                     comment=user_comment
                 )
 
-                print("\nThank you for your feedback!")
+                # Create a parent span for the goodbye message
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query",
+                    input={"user_input": user_input}
+                ) as span:
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        goodbye_message = goodbye_chain.invoke(
+                            {"user_id": user_id, "user_input": user_input},
+                            config={
+                                "run_name": "goodbye-message",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
+
+                        # Set the output on the parent span
+                        span.update(output={"response": goodbye_message.content})
+
+                print(f"System: {goodbye_message.content}")
+
                 break
 
+            conversation = list(redis_history.messages)
             human_message = HumanMessage(user_input)
             conversation.append(human_message)
 
