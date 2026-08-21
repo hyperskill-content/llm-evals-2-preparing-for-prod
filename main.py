@@ -1,4 +1,3 @@
-# Start from the last coding stage of the previous LLM evals project
 import json
 import os
 import sys
@@ -18,6 +17,10 @@ from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
+
 # Load environment variables from .env file
 env_path = Path(".env")
 if not env_path.exists():
@@ -32,7 +35,7 @@ user_id = users[uuid.uuid4().int % len(users)]
 
 redis_url = os.getenv("REDIS_URL", "redis://localhost:6380/0")
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
+# Initialize the LLM with OpenAI API credentials
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL"),
     base_url=os.getenv("OPENAI_BASE_URL"),
@@ -46,9 +49,6 @@ embeddings_model = OpenAIEmbeddings(
     api_key=os.getenv("OPENAI_API_KEY"),
     show_progress_bar=True
 )
-
-# Initialize conversation history
-# conversation = []
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -213,13 +213,20 @@ def generate_context(ai_message: AIMessage, conversation: list) -> dict:
 # Main Conversation Loop
 # ---------------------------
 def main():
-    # List of available tools
-    tools = [smartphone_info_tool]
+    # Load Guardrails
+    guardrails_config = RailsConfig.from_path("config")
+    openai_base_url = os.getenv("OPENAI_BASE_URL")
+    if openai_base_url:
+        for model in guardrails_config.models:
+            if model.parameters is None:
+                model.parameters = {}
+            model.parameters["base_url"] = openai_base_url
 
-    # Bind the tools to the language model instance
+    input_rails = RunnableRails(guardrails_config, input_key="user_input")
+
+    tools = [smartphone_info_tool]
     llm_with_tools = llm.bind_tools(tools)
 
-    # Initialize Redis Chat History with 1-hour TTL
     redis_history = RedisChatMessageHistory(
         session_id=session_id,
         url=redis_url,
@@ -242,7 +249,6 @@ def main():
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
-    # Retrieve goodbye system prompt from Langfuse
     goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
     goodbye_prompt = PromptTemplate.from_template(
         goodbye_lf_prompt.get_langchain_prompt()
@@ -318,19 +324,37 @@ def main():
             user_message = HumanMessage(user_input)
             turn_conversation.append(user_message)
 
-
-            # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
                 as_type="span",
                 name="user-query",
                 input={"user_input": user_input}
             ) as span:
-                # Propagate trace attributes to all child observations
-                with propagate_attributes(
-                    session_id=session_id,
-                    user_id=user_id
-                ):
-                    # Context chain invocation
+                with propagate_attributes(session_id=session_id, user_id=user_id):
+                    # Validate input via NeMo Guardrails
+                    validation_result = input_rails.rails.generate(
+                        messages=[{"role": "user", "content": user_input}],
+                        options=GenerationOptions(
+                            rails=["input"],
+                            output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                        ),
+                    )
+
+                    validation_context = validation_result.output_data or {}
+                    rail_triggered = validation_context.get("allowed") is False or bool(
+                        validation_context.get("triggered_input_rail")
+                    )
+
+                    if rail_triggered:
+                        blocked_response = (
+                            validation_result.response[0]["content"]
+                            if validation_result.response
+                            else "I'm sorry, I can't respond to that."
+                        )
+                        span.update(output={"response": blocked_response})
+                        print(f"System: {blocked_response}")
+                        continue  # Skip chains and Redis storage
+
+                    # Execution flow if rails pass
                     ai_context_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": turn_conversation},
                         config={
