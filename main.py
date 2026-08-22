@@ -37,16 +37,16 @@ redis_url = os.getenv("REDIS_URL", "redis://localhost:6380/0")
 
 # Initialize the LLM with OpenAI API credentials
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_CHAT_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_CHAT_KEY")
 )
 
 # Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDINGS_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_EMBEDDINGS_KEY"),
     show_progress_bar=True
 )
 
