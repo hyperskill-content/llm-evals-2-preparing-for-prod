@@ -16,6 +16,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -234,6 +237,32 @@ def generate_context(ai_message: AIMessage, conversation: list) -> None:
         )
 
 
+def get_guardrail_message(validation_result) -> str:
+    """Extract a user-facing message from a blocked NeMo Guardrails result."""
+    response = validation_result.response
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        return response.get("content", "I'm sorry, I can't respond to that.")
+    if isinstance(response, list) and response:
+        first_message = response[0]
+        if isinstance(first_message, dict):
+            return first_message.get("content", "I'm sorry, I can't respond to that.")
+
+    return "I'm sorry, I can't respond to that."
+
+
+def load_input_rails() -> RunnableRails:
+    """Load NeMo rails and resolve environment-backed model parameters."""
+    rails_config = RailsConfig.from_path("config/")
+    for model in rails_config.models:
+        for parameter, value in model.parameters.items():
+            if isinstance(value, str) and value in os.environ:
+                model.parameters[parameter] = os.environ[value]
+
+    return RunnableRails(rails_config, input_key="user_input")
+
+
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
@@ -259,6 +288,8 @@ def main():
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
+
+    input_rails = load_input_rails()
 
     redis_history = RedisChatMessageHistory(
         session_id=session_id,
@@ -332,6 +363,45 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    with langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="input-guardrail",
+                        input={"user_input": user_input},
+                    ) as guardrail_span:
+                        validation_result = input_rails.rails.generate(
+                            messages=[{"role": "user", "content": user_input}],
+                            options=GenerationOptions(
+                                rails=["input"],
+                                output_vars=[
+                                    "allowed",
+                                    "triggered_input_rail",
+                                    "bot_message",
+                                ],
+                            ),
+                        )
+
+                        validation_context = validation_result.output_data or {}
+                        rail_triggered = (
+                            validation_context.get("allowed") is False
+                            or bool(validation_context.get("triggered_input_rail"))
+                        )
+                        guardrail_span.update(
+                            output={
+                                "blocked": rail_triggered,
+                                "triggered_input_rail": validation_context.get(
+                                    "triggered_input_rail"
+                                ),
+                            }
+                        )
+
+                    if rail_triggered:
+                        blocked_message = get_guardrail_message(validation_result)
+                        span.update(
+                            output={"response": blocked_message, "blocked": True}
+                        )
+                        print(f"System: {blocked_message}")
+                        continue
+
                     # Context chain invocation
                     context_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
