@@ -69,6 +69,42 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
 
 ### Running the Application
 
+Task 4 routes chat, embeddings, and guardrail requests through a local LiteLLM
+proxy. Before starting it, add strong values to `.env`:
+
+```env
+LITELLM_MASTER_KEY=sk-<strong-random-master-key>
+LITELLM_SALT_KEY=<strong-random-salt-key>
+LITELLM_BASE_URL=http://localhost:4000/v1
+LITELLM_MODEL=smartphone-chat
+LITELLM_EMBEDDINGS_MODEL=smartphone-embeddings
+```
+
+Start the pinned LiteLLM and PostgreSQL services:
+
+```bash
+docker compose -f docker-compose.litellm.yml up -d
+```
+
+Open the admin UI at [http://localhost:4000/ui/](http://localhost:4000/ui/),
+sign in as `admin` with `LITELLM_MASTER_KEY`, and create a virtual key with
+access to `smartphone-chat` and `smartphone-embeddings`. Add that key to `.env`:
+
+```env
+LITELLM_API_KEY=sk-<generated-virtual-key>
+```
+
+You can also generate the virtual key through the API:
+
+```bash
+curl http://localhost:4000/key/generate \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"key_alias":"smartphone-app","models":["smartphone-chat","smartphone-embeddings"],"max_budget":0.10,"budget_duration":"1d"}'
+```
+
+Then run the application:
+
 ```bash
 uv run python main.py
 ```
@@ -156,6 +192,8 @@ Here are the main directories and files in this repo:
 │   └── task_4.md
 ├── .env.sample
 ├── .gitignore
+├── docker-compose.litellm.yml
+├── litellm-config.yaml
 ├── main.py
 ├── pyproject.toml
 ├── README.md

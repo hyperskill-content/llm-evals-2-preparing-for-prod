@@ -28,18 +28,19 @@ session_id = f"session-{uuid.uuid4().hex[:8]}"
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
+# Route model traffic through LiteLLM so virtual-key limits and user budgets apply.
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_MODEL", "smartphone-chat"),
+    base_url=os.getenv("LITELLM_BASE_URL", "http://localhost:4000/v1"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": user_id},
 )
 
-# Initialize the embeddings model with OpenAI API credentials
+# Route embeddings through the same proxy and virtual key.
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDINGS_MODEL", "smartphone-embeddings"),
+    base_url=os.getenv("LITELLM_BASE_URL", "http://localhost:4000/v1"),
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True
 )
 
@@ -277,7 +278,9 @@ def main():
 
     trimmer = trim_messages(
         strategy="last",
-        token_counter=llm,
+        # LiteLLM model aliases are not known to provider-specific tokenizers.
+        # The model-independent counter keeps trimming reliable across routes.
+        token_counter="approximate",
         max_tokens=500,
         start_on="human",
         end_on=("human", "tool"),
