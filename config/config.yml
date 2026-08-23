@@ -1,8 +1,8 @@
 models:
   - type: main
     engine: openai
-    model: gpt-4o-mini
-    api_key_env_var: OPENAI_API_KEY
+    model: smartphone-chat-model
+    api_key_env_var: LITELLM_API_KEY
     parameters:
       base_url: OPENAI_BASE_URL_PLACEHOLDER
 
