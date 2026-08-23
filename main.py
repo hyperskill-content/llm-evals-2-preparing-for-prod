@@ -21,9 +21,6 @@ from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from nemoguardrails.rails.llm.options import GenerationOptions
 
-# Debug option
-set_debug(False)
-
 # Load environment variables from .env file
 dotenv.load_dotenv()
 
