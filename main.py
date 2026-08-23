@@ -1,46 +1,54 @@
 # Start from the last coding stage of the previous LLM evals project
 import json
 import os
+import re
 import sys
 import uuid
+from difflib import SequenceMatcher
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
+from openai import RateLimitError
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380/0")
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=os.getenv("LITELLM_CHAT_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
+    model_kwargs={"user": user_id},
+    tiktoken_model_name="gpt-4o-mini",
 )
 
-# Initialize the embeddings model with OpenAI API credentials
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDINGS_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL"),
+    api_key=os.getenv("LITELLM_API_KEY"),
     show_progress_bar=True
 )
 
-# Initialize conversation history
-conversation = []
+# loaded fresh into a local list at the start of each turn.
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -50,20 +58,20 @@ langfuse = get_client()
 # Load JSON Data and Build Qdrant Vector Store
 # ---------------------------
 
-@observe(name="embed_documents")
-def embed_documents(json_path: str) -> QdrantVectorStore | list:
+def load_smartphone_data(json_path: str) -> list:
     """
-    Load JSON data from the smartphones.json file and convert each entry to a Document.
+    Load raw smartphone JSON data from disk. Used both for building the vector
+    store (embed_documents) and for fuzzy model-name matching (known_models).
+
     :param
         json_path (str): Path to the JSON file containing smartphone data.
 
     :returns
-        A Qdrant vector store built from the smartphone documents,
-        or an empty list if an error occurs.
+        A list of smartphone dicts, or an empty list if an error occurs.
     """
     try:
         with open(json_path, "r") as f:
-            data = json.load(f)
+            return json.load(f)
     except FileNotFoundError:
         print(f"Error: The file {json_path} was not found.")
         return []
@@ -74,6 +82,9 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
         print(f"An unexpected error occurred while reading {json_path}: {e}")
         return []
 
+
+@observe(name="embed_documents")
+def embed_documents(data: list) -> QdrantVectorStore | list:
     documents = []
     for entry in data:
         # Build a readable content string from the JSON entry
@@ -117,7 +128,6 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
 
             return qdrant_store
 
-        # no need to create a vector store every time
         else:
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
@@ -131,32 +141,56 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
         return []
 
 
-# Initialize the vector store
-product_db = embed_documents("datasets/smartphones.json")
+# Load the raw JSON data once, then reuse it both for the vector store and for
+# fuzzy model-name matching in the tool below.
+smartphone_data = load_smartphone_data("datasets/smartphones.json")
+product_db = embed_documents(smartphone_data)
+known_models = [entry["model"] for entry in smartphone_data]
 
 
 # ---------------------------
 # Tool Definitions
 # ---------------------------
+
+def token_sort_ratio(a: str, b: str) -> float:
+    a_sorted = " ".join(sorted(a.lower().split()))
+    b_sorted = " ".join(sorted(b.lower().split()))
+    return SequenceMatcher(None, a_sorted, b_sorted).ratio() * 100
+
+
+def extract_numbers(s: str) -> set:
+    return set(re.findall(r"\d+", s))
+
+
 @tool("SmartphoneInfo")
 def smartphone_info_tool(model: str) -> str:
     """
-    Retrieves information about a smartphone model from the product database.
-
-    :param
-        model (str): The smartphone model to search for.
-
-    :returns
-        str: The smartphone's specifications, price, and availability,
-             or an error message if not found or if an error occurs.
+    Look up a smartphone model in the catalog. Uses substring matching first,
+    then falls back to fuzzy matching with a number-mismatch guard to avoid
+    hallucinating specs for models that are not actually in the catalog.
     """
     try:
-        results = product_db.similarity_search(model, k=1)
-        if not results:
-            print(f"Info: No results found for model: {model}")
-            return "Could not find information for the specified model."
-        info = results[0].page_content
-        return info
+        if not known_models:
+            return "Smartphone catalog is currently unavailable."
+
+        # 1. Exact substring match first (handles e.g. "Galaxy S23 Ultra" ->
+        #    "Samsung Galaxy S23 Ultra 5G")
+        lower_query = model.lower()
+        substring_matches = [m for m in known_models if lower_query in m.lower()]
+        if substring_matches:
+            best = min(substring_matches, key=len)  # shortest containing match = closest
+        else:
+            # 2. Fuzzy fallback with number-mismatch guard
+            scored = sorted(known_models, key=lambda c: -token_sort_ratio(model, c))
+            top_match = scored[0]
+            q_nums, m_nums = extract_numbers(model), extract_numbers(top_match)
+            score = token_sort_ratio(model, top_match)
+            if (q_nums and not (q_nums & m_nums)) or score < 60:
+                return f"No information found for \'{model}\' in our catalog."
+            best = top_match
+
+        results = product_db.similarity_search(best, k=1)
+        return results[0].page_content
     except Exception as e:
         return f"Error during smartphone information retrieval for model {model}: {e}"
 
@@ -165,18 +199,18 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> None:
+def generate_context(ai_message: AIMessage, conversation: list) -> None:
     """
     Process tool calls from the language model and append the AI message and
-    each tool's response as ToolMessage objects to the conversation history.
+    each tool's response as ToolMessage objects to the passed-in conversation list.
 
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
+        conversation (list): The current turn's in-memory conversation history
+                              (loaded from Redis + current user input).
     """
-    # construct the conversation history with the AI message containing tool calls
     conversation.append(ai_message)
 
-    # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
         conversation.append(
             AIMessage(
@@ -185,8 +219,6 @@ def generate_context(ai_message: AIMessage) -> None:
         )
 
     try:
-        # Process each tool call, invoke the appropriate tool, and append the result to the conversation
-        # a message with tool calls is expected to be followed by tool responses
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
@@ -205,66 +237,46 @@ def generate_context(ai_message: AIMessage) -> None:
 # Main Conversation Loop
 # ---------------------------
 def main():
-    # List of available tools
     tools = [smartphone_info_tool]
 
-    # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_system_prompt = """
-        You're part of a smartphone recommendation system. Your work is to use the SmartphoneInfo tool to retrieve information about smartphones based on user queries.
-          - If the user requests specs/comparisons/recommendations for a model explicitly mentioned in chat or can be inferred from the conversation history, call SmartphoneInfo(model)
-          - If multiple models are mentioned or from the conversation history, you must call SmartphoneInfo for each model separately.
-          - If the user asks a general question, do nothing.
-        Do not guess or recommend a model from internal knowledge; the model name must be clear from the chat history or user input.
+    # ---------------------------
+    # Fetch prompts from Langfuse (Task 1: Prompt Management and Versioning)
+    # ---------------------------
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    context_prompt = ChatPromptTemplate.from_messages([
+        context_lf_prompt.get_langchain_prompt()[0],
+        MessagesPlaceholder(variable_name="conversation"),
+    ])
+    context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
-        Current question: {user_input}
-    """
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    review_prompt = ChatPromptTemplate.from_messages([
+        review_lf_prompt.get_langchain_prompt()[0],
+        MessagesPlaceholder(variable_name="conversation"),
+    ])
+    review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
-    review_system_prompt = """
-        You are an expert AI assistant helping customers pick the best smartphone from our catalog. Follow these rules strictly:
-
-        1. Focus solely on concise (under 100 words), human-like, personalized reviews/comparisons of models named in the user's query or provided context.
-        2. Think step by step before answering.
-        3. Never guess or recommend any model not explicitly mentioned in the context or query.
-        4. If no model is given, ask the user to check our online catalog for the exact model name.
-        5. DO NOT assist with ordering, returns, tracking, or other general support.
-        6. If asked about anything outside smartphone features/comparisons, respond that you can't help.
-        7. If the user only wants to chat, engage briefly, but always steer back to smartphone comparisons.
-        8. Never list smartphone specifications, but instead explain how they translate to real-world benefits.
-
-        When recommending, evaluate performance, display, battery, camera, and special functions (e.g., 5G, fast charging, expandable storage), and how they translate to real-world benefits.
-        Always confirm the user's needs before finalizing.
-
-        Current user: {user_id}
-        Current question: {user_input}
-    """
-
-    goodbye_system_prompt = """
-        You have been helping the user: {user_id} with smartphone features and comparisons.
-        Generate a short friendly goodbye message for the user and also thank them for their feedback.
-        (note that you've already been helping the user with smartphone features and comparisons, so do not repeat that or greet them again)
-    """
-
-    context_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(context_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
-
-    review_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(review_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
-
+    goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
     goodbye_prompt = PromptTemplate.from_template(
-        goodbye_system_prompt
+        goodbye_lf_prompt.get_langchain_prompt()
+    )
+    goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
+
+    # ---------------------------
+    # Task 2: Message trimming to bound token usage
+    # ---------------------------
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=llm,
+        max_tokens=500,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
     )
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | trimmer | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
@@ -272,39 +284,76 @@ def main():
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
 
+    # ---------------------------
+    # Task 2: Redis-backed chat history (replaces global `conversation = []`)
+    # ---------------------------
+    redis_history = RedisChatMessageHistory(
+        session_id=session_id,
+        redis_url=REDIS_URL,
+        ttl=3600  # expire after 1 hour of inactivity
+    )
+
+    # ---------------------------
+    # Task 3: Guardrails input validation via NeMo Guardrails
+    # ---------------------------
+    with open("config/config.yml", "r") as f:
+        config_yaml_content = f.read().replace(
+            "OPENAI_BASE_URL_PLACEHOLDER", os.getenv("LITELLM_BASE_URL")
+        )
+
+    with open("config/prompts.yml", "r") as f:
+        prompts_yaml_content = f.read()
+
+    guardrails_config = RailsConfig.from_content(
+        colang_content="",
+        yaml_content=config_yaml_content + "\n" + prompts_yaml_content,
+    )
+
+    input_rails = RunnableRails(guardrails_config, input_key="user_input")
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
-                with langfuse.start_as_current_observation(
-                    as_type="span",
-                    name="user-query",
-                    input={"user_input": user_input}
-                ) as span:
-                    with propagate_attributes(
-                        session_id=session_id,
-                        user_id=user_id
-                    ):
-                        goodbye_message = goodbye_chain.invoke(
-                            {"user_id": user_id},
-                            config={
-                                "run_name": "goodbye-message",
-                                "callbacks": [langfuse_handler]
-                            }
-                        )
+                try:
+                    with langfuse.start_as_current_observation(
+                        as_type="span",
+                        name="user-query",
+                        input={"user_input": user_input}
+                    ) as span:
+                        with propagate_attributes(
+                            session_id=session_id,
+                            user_id=user_id
+                        ):
+                            goodbye_message = goodbye_chain.invoke(
+                                {"user_id": user_id},
+                                config={
+                                    "run_name": "goodbye-message",
+                                    "callbacks": [langfuse_handler]
+                                }
+                            )
 
-                        # Set the output on the parent span
-                        span.update(output={"response": goodbye_message.content})
+                            # Set the output on the parent span
+                            span.update(output={"response": goodbye_message.content})
 
-                print(f"System: {goodbye_message.content}")
+                    print(f"System: {goodbye_message.content}")
+
+                except RateLimitError as budget_error:
+                    # ---------------------------
+                    # Task 4: Graceful handling of LiteLLM budget-exceeded errors
+                    # ---------------------------
+                    print(
+                        f"System: Sorry {user_id}, you have reached your usage limit for today "
+                        "and I can't process any more requests right now. Please try again later."
+                    )
+                    print(f"[debug] Budget error detail: {budget_error}")
 
                 # Collect user feedback about the entire conversation
                 feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
                 user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
 
-                # Score at the session level (not individual trace)
                 langfuse.create_score(
                     session_id=session_id,  # Use the session_id from the start of the conversation
                     name="conversation_usefulness",
@@ -312,46 +361,124 @@ def main():
                     data_type="CATEGORICAL",
                     comment=user_comment
                 )
+                langfuse.flush()
 
                 print("\nThank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            # Load history fresh from Redis each turn, then append current input in-memory
+            conversation = list(redis_history.messages)
+            user_message = HumanMessage(user_input)
+            conversation.append(user_message)
+
+            # ---------------------------
+            # Task 3: Validate input BEFORE invoking any chain or making an LLM call
+            # ---------------------------
+            try:
+                validation_result = input_rails.rails.generate(
+                    messages=[{"role": "user", "content": user_input}],
+                    options=GenerationOptions(
+                        rails=["input"],
+                        output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                    ),
+                )
+            except RateLimitError as budget_error:
+                # ---------------------------
+                # Task 4: Graceful handling of LiteLLM budget-exceeded errors
+                # raised during the guardrails self-check-input LLM call.
+                # ---------------------------
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query-budget-exceeded",
+                    input={"user_input": user_input},
+                ) as span:
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        span.update(
+                            output={"response": str(budget_error)},
+                            level="WARNING",
+                        )
+
+                print(
+                    f"System: Sorry {user_id}, you have reached your usage limit for today "
+                    "and I can't process any more requests right now. Please try again later."
+                )
+                print(f"[debug] Budget error detail: {budget_error}")
+                continue
+
+            validation_context = validation_result.output_data or {}
+            rail_triggered = validation_context.get("allowed") is False or bool(
+                validation_context.get("triggered_input_rail")
+            )
+
+            if rail_triggered:
+                blocked_message = validation_result.response[0]["content"]
+
+                # Trace the blocked attempt in Langfuse for later guardrail tuning
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query-blocked",
+                    input={"user_input": user_input},
+                ) as span:
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        span.update(output={"response": blocked_message}, level="WARNING")
+
+                print(f"System: {blocked_message}")
+                continue  # Skip chains and Redis persistence entirely
 
             # Create a parent span for this user query to group all chain invocations
-            with langfuse.start_as_current_observation(
-                as_type="span",
-                name="user-query",
-                input={"user_input": user_input}
-            ) as span:
-                # Propagate trace attributes to all child observations
-                with propagate_attributes(
-                    session_id=session_id,
-                    user_id=user_id
-                ):
-                    # Context chain invocation
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "context",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+            try:
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query",
+                    input={"user_input": user_input}
+                ) as span:
+                    # Propagate trace attributes to all child observations
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        # Context chain invocation (tool calls happen in-memory only)
+                        ai_message = context_chain.invoke(
+                            {"user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "context",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
+                        generate_context(ai_message, conversation)
 
-                    # Final response chain invocation
-                    response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "final-response",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+                        # Final response chain invocation
+                        response = review_chain.invoke(
+                            {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "final-response",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
 
-                # Set the output on the parent span
-                span.update(output={"response": response.content})
+                    span.update(output={"response": response.content})
+
+            except RateLimitError as budget_error:
+                print(
+                    f"System: Sorry {user_id}, you have reached your usage limit for today "
+                    "and I can't process any more requests right now. Please try again later."
+                )
+                print(f"[debug] Budget error detail: {budget_error}")
+                continue  # Skip printing/persisting a response, go back for next input
 
             print(f"System: {response.content}")
-            conversation.append(response)
+
+            # Persist only the user's message and the final AI response to Redis
+            # (tool calls and intermediate messages stay in-memory for this turn only,
+            # and blocked turns are never saved)
+            redis_history.add_message(user_message)
+            redis_history.add_message(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
