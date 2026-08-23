@@ -16,6 +16,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -42,7 +45,7 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# NOTE: global `conversation = []` removed — history now lives in Redis,
+# NOTE: global `conversation = []` removed (Task 2) ” history now lives in Redis,
 # loaded fresh into a local list at the start of each turn.
 
 # Initialize Langfuse client
@@ -57,6 +60,12 @@ langfuse = get_client()
 def embed_documents(json_path: str) -> QdrantVectorStore | list:
     """
     Load JSON data from the smartphones.json file and convert each entry to a Document.
+    :param
+        json_path (str): Path to the JSON file containing smartphone data.
+
+    :returns
+        A Qdrant vector store built from the smartphone documents,
+        or an empty list if an error occurs.
     """
     try:
         with open(json_path, "r") as f:
@@ -73,6 +82,7 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
 
     documents = []
     for entry in data:
+        # Build a readable content string from the JSON entry
         content = (
             f"Model: {entry.get('model', '')}\n"
             f"Price: {entry.get('price', '')}\n"
@@ -102,18 +112,23 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
                     distance=Distance.COSINE,
                 ),
             )
+
             qdrant_store = QdrantVectorStore(
                 client=qdrant_client,
                 collection_name=collection_name,
                 embedding=embeddings_model
             )
+
             qdrant_store.add_documents(documents=documents)
+
             return qdrant_store
+
         else:
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
                 collection_name=collection_name,
             )
+
             return qdrant_store
 
     except Exception as e:
@@ -132,6 +147,13 @@ product_db = embed_documents("datasets/smartphones.json")
 def smartphone_info_tool(model: str) -> str:
     """
     Retrieves information about a smartphone model from the product database.
+
+    :param
+        model (str): The smartphone model to search for.
+
+    :returns
+        str: The smartphone's specifications, price, and availability,
+             or an error message if not found or if an error occurs.
     """
     try:
         results = product_db.similarity_search(model, k=1)
@@ -187,10 +209,11 @@ def generate_context(ai_message: AIMessage, conversation: list) -> None:
 # ---------------------------
 def main():
     tools = [smartphone_info_tool]
+
     llm_with_tools = llm.bind_tools(tools)
 
     # ---------------------------
-    # Fetch prompts from Langfuse (Task 1)
+    # Fetch prompts from Langfuse (Task 1: Prompt Management and Versioning)
     # ---------------------------
     context_lf_prompt = langfuse.get_prompt("context_system_prompt")
     context_prompt = ChatPromptTemplate.from_messages([
@@ -226,8 +249,10 @@ def main():
 
     context_chain = context_prompt | trimmer | llm_with_tools
     review_chain = review_prompt | llm
+
     goodbye_chain = goodbye_prompt | llm
 
+    # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
 
     # ---------------------------
@@ -239,11 +264,30 @@ def main():
         ttl=3600  # expire after 1 hour of inactivity
     )
 
+    # ---------------------------
+    # Task 3: Guardrails ” input validation via NeMo Guardrails
+    # ---------------------------
+    with open("config/config.yml", "r") as f:
+        config_yaml_content = f.read().replace(
+            "OPENAI_BASE_URL_PLACEHOLDER", os.getenv("OPENAI_BASE_URL")
+        )
+
+    with open("config/prompts.yml", "r") as f:
+        prompts_yaml_content = f.read()
+
+    guardrails_config = RailsConfig.from_content(
+        colang_content="",
+        yaml_content=config_yaml_content + "\n" + prompts_yaml_content,
+    )
+
+    input_rails = RunnableRails(guardrails_config, input_key="user_input")
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
+                # Create a parent span for the goodbye message
                 with langfuse.start_as_current_observation(
                     as_type="span",
                     name="user-query",
@@ -260,15 +304,18 @@ def main():
                                 "callbacks": [langfuse_handler]
                             }
                         )
+
+                        # Set the output on the parent span
                         span.update(output={"response": goodbye_message.content})
 
                 print(f"System: {goodbye_message.content}")
 
+                # Collect user feedback about the entire conversation
                 feedback = input("\nWas this conversation helpful? (Yes/No): ").strip()
                 user_comment = input("Please give us a reason for your answer. This will help us improve: ").strip()
 
                 langfuse.create_score(
-                    session_id=session_id,
+                    session_id=session_id,  # Use the session_id from the start of the conversation
                     name="conversation_usefulness",
                     value=feedback,
                     data_type="CATEGORICAL",
@@ -284,16 +331,52 @@ def main():
             user_message = HumanMessage(user_input)
             conversation.append(user_message)
 
+            # ---------------------------
+            # Task 3: Validate input BEFORE invoking any chain or making an LLM call
+            # ---------------------------
+            validation_result = input_rails.rails.generate(
+                messages=[{"role": "user", "content": user_input}],
+                options=GenerationOptions(
+                    rails=["input"],
+                    output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                ),
+            )
+
+            validation_context = validation_result.output_data or {}
+            rail_triggered = validation_context.get("allowed") is False or bool(
+                validation_context.get("triggered_input_rail")
+            )
+
+            if rail_triggered:
+                blocked_message = validation_result.response[0]["content"]
+
+                # Trace the blocked attempt in Langfuse for later guardrail tuning
+                with langfuse.start_as_current_observation(
+                    as_type="span",
+                    name="user-query-blocked",
+                    input={"user_input": user_input},
+                ) as span:
+                    with propagate_attributes(
+                        session_id=session_id,
+                        user_id=user_id
+                    ):
+                        span.update(output={"response": blocked_message}, level="WARNING")
+
+                print(f"System: {blocked_message}")
+                continue  # Skip chains and Redis persistence entirely
+
+            # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
                 as_type="span",
                 name="user-query",
                 input={"user_input": user_input}
             ) as span:
+                # Propagate trace attributes to all child observations
                 with propagate_attributes(
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    # Context chain: tool calls happen in-memory only
+                    # Context chain invocation (tool calls happen in-memory only)
                     ai_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
                         config={
@@ -303,7 +386,7 @@ def main():
                     )
                     generate_context(ai_message, conversation)
 
-                    # Final response chain
+                    # Final response chain invocation
                     response = review_chain.invoke(
                         {"user_id": user_id, "user_input": user_input, "conversation": conversation},
                         config={
@@ -316,7 +399,9 @@ def main():
 
             print(f"System: {response.content}")
 
-            # Persist only the user's message and the final AI response — not tool calls/intermediate messages
+            # Persist only the user's message and the final AI response to Redis
+            # (tool calls and intermediate messages stay in-memory for this turn only,
+            # and blocked turns are never saved)
             redis_history.add_message(user_message)
             redis_history.add_message(response)
 
