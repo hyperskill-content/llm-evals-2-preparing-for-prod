@@ -6,6 +6,7 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
+from langchain_core.globals import set_debug
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
@@ -16,9 +17,22 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
+
+# Debug option
+set_debug(False)
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
+
+# Load guardrails configuration
+config = RailsConfig.from_path("config/")
+
+# Create guardrails instance for input validation only
+input_rails = RunnableRails(config, input_key="user_input")
+output_rails = RunnableRails(config, input_key="response")
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
@@ -312,6 +326,7 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
+            # Create user message
             user_message = HumanMessage(user_input)
             conversation.append(user_message)
 
@@ -326,7 +341,39 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    # Context chain invocation
+
+                    validation_result = input_rails.rails.generate(
+                        messages=[{"role": "user", "content": user_input}],
+                        options=GenerationOptions(
+                            rails=["input"],
+                            output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                        ),
+                    )
+
+                    validation_context = validation_result.output_data or {}
+                    input_allowed = validation_context.get("allowed")
+                    triggered_input_rail = validation_context.get("triggered_input_rail")
+                    rail_triggered = input_allowed is False or bool(triggered_input_rail)
+
+                    span.update(
+                        metadata={
+                            "input_guardrail_allowed": input_allowed,
+                            "input_guardrail_triggered_rail": triggered_input_rail
+                        }
+                    )
+
+                    if rail_triggered:
+                        # Rail triggered - skip further processing
+                        span.update(
+                            output={"response": validation_result.response[0]["content"]},
+                            level="WARNING",
+                            status_message="Input blocked by a guardrail"
+                        )
+                        span.score_trace(name="guardrail_blocked", value=1, data_type="BOOLEAN")
+                        print(f"System: {validation_result.response[0]["content"]}")
+                        continue  # Skip saving to Redis and proceed to next input
+
+                    # Rail not triggered - continue with normal processing
                     ai_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
                         config={
@@ -345,12 +392,46 @@ def main():
                         }
                     )
 
-                # Set the output on the parent span
+                output_validation_result = output_rails.rails.generate(
+                    messages=[
+                        {"role": "user", "content": ""},
+                        {"role": "assistant", "content": response.content}
+                    ],
+                    options=GenerationOptions(
+                        rails=["output"],
+                        output_vars=["allowed", "triggered_output_rail", "bot_message"],
+                    ),
+                )
+
+                output_validation_context = output_validation_result.output_data or {}
+                output_allowed = output_validation_context.get("allowed")
+                triggered_output_rail = output_validation_context.get("triggered_output_rail")
+                output_rail_triggered = output_allowed is False or bool(triggered_output_rail)
+
+                span.update(
+                    metadata={
+                        "output_guardrail_allowed": output_allowed,
+                        "output_guardrail_triggered_rail": triggered_output_rail,
+                    }
+                )
+
+                if output_rail_triggered:
+                    # Rail triggered - skip further processing
+                    span.update(
+                        output={"response": output_validation_result.response[0]["content"]},
+                        level="WARNING",
+                        status_message="Output blocked by guardrail",
+                    )
+                    span.score_trace(name="guardrail_blocked", value=1, data_type="BOOLEAN")
+                    print(f"System: {output_validation_result.response[0]["content"]}")
+                    continue
+
                 span.update(output={"response": response.content})
+                span.score_trace(name="guardrail_blocked", value=0, data_type="BOOLEAN")
 
             print(f"System: {response.content}")
 
-            # Save only user input and final response
+            # Save only user input and final response (only when rail not triggered)
             redis_history.add_message(user_message)
             redis_history.add_message(response)
 
