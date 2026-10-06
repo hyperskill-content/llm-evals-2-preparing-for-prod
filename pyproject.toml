@@ -10,7 +10,7 @@ dependencies = [
     "python-dotenv",
     "langchain-community",
     "langfuse>=4.0.0",
-    "qdrant-client",
+    "qdrant-client==1.19.1",
     "langchain-qdrant",
     "requests",
     "langchain",
