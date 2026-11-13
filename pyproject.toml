@@ -16,7 +16,7 @@ dependencies = [
     "langchain",
     "langchain-redis>=0.2.5",
     "redis>=7.4.0",
-    "nemoguardrails>=0.22.0",
+    "nemoguardrails>=0.24.1",
 ]
 
 [dependency-groups]
