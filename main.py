@@ -16,6 +16,9 @@ from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 from langchain_redis import RedisChatMessageHistory
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -45,6 +48,13 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 # Initialize Langfuse client
 langfuse = get_client()
+
+# Load the guardrails configuration (config/config.yml and config/prompts.yml)
+guardrails_config = RailsConfig.from_path("config/")
+
+# Guardrails instance used only to check user input.
+# llm=llm: the guardrail check uses the same ChatOpenAI model as the rest of the app.
+input_rails = RunnableRails(guardrails_config, llm=llm, input_key="user_input")
 
 
 # ---------------------------
@@ -333,6 +343,44 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    # Check the user input with the guardrail before any chain runs.
+                    # The check is recorded in Langfuse as a "guardrail" observation inside this trace.
+                    with langfuse.start_as_current_observation(
+                        as_type="guardrail",
+                        name="input-guardrail",
+                        input={"user_input": user_input}
+                    ) as guardrail:
+                        # rails=["input"]: run only the input rails, not a full bot response
+                        validation_result = input_rails.rails.generate(
+                            messages=[{"role": "user", "content": user_input}],
+                            options=GenerationOptions(
+                                rails=["input"],
+                                output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                            ),
+                        )
+
+                        # output_data holds the variables requested in output_vars
+                        validation_context = validation_result.output_data or {}
+                        rail_triggered = validation_context.get("allowed") is False or bool(
+                            validation_context.get("triggered_input_rail")
+                        )
+
+                        guardrail.update(output={
+                            "blocked": rail_triggered,
+                            "triggered_input_rail": validation_context.get("triggered_input_rail"),
+                        })
+
+                    if rail_triggered:
+                        # The guardrail's refusal message, e.g. "I'm sorry, I can't respond to that."
+                        blocked_message = validation_result.response[0]['content']
+                        span.update(
+                            output={"response": blocked_message},
+                            metadata={"blocked_by_guardrail": True}
+                        )
+                        print(f"System: {blocked_message}")
+                        # Skip the chains and the Redis save; go back to the top of the while loop
+                        continue
+
                     # Context chain invocation: returns the AIMessage with the tool calls
                     ai_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},

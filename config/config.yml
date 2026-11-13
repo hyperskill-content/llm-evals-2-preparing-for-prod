@@ -1,0 +1,16 @@
+# NeMo Guardrails configuration ("rails" = guardrails)
+# No `models:` section: main.py passes its own ChatOpenAI object (llm=llm) to RunnableRails,
+# so the guardrail check uses the same OPENAI_MODEL, OPENAI_BASE_URL and OPENAI_API_KEY from .env.
+
+rails:
+  input:
+    flows:
+      - self check input   # built-in flow: asks the LLM whether the user message should be blocked
+
+instructions:
+  - type: general
+    content: |
+      You verify inputs for a bot called the Smartphones info Bot.
+      The bot is designed to answer questions about smartphones such as comparisons and recommendations.
+      The bot can access smartphone details using context, but must be given the exact phone model.
+      If the bot is asked customer support queries like ordering, returns, tracking, etc, the bot replies it cannot help with such requests.

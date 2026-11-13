@@ -147,8 +147,13 @@ Here are the main directories and files in this repo:
 │       ├── prompt_metrics.png
 │       ├── prompt_observations.png
 │       └── prompts_playground.png
+├── config/
+│   ├── config.yml        # NeMo Guardrails settings: input rail and bot instructions
+│   └── prompts.yml       # prompt for the self check input rail
 ├── datasets/
 │   └── smartphones.json
+├── scripts/
+│   └── create_langfuse_prompts.py   # one-time upload of the app's prompts to Langfuse
 ├── tasks/
 │   ├── task_1.md
 │   ├── task_2.md
