@@ -1,0 +1,40 @@
+# LiteLLM proxy configuration. Loaded by docker-compose.yml with --config /app/config.yaml.
+# "os.environ/NAME" means: read NAME from the container's environment (set in litellm/.env).
+#
+# Replace the two <...> model names before starting the proxy (see the comments on each).
+
+model_list:
+  # Chat model. model_name is the name the app sends (OPENAI_MODEL in the app's .env).
+  # Keep it the same as your current OPENAI_MODEL so the trimmer's token counter still recognizes it.
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini          # openai/ = provider speaks the OpenAI API format
+      api_base: os.environ/UPSTREAM_OPENAI_BASE_URL     # your real provider URL
+      api_key: os.environ/UPSTREAM_OPENAI_API_KEY       # your real provider key
+      rpm: 10           # requests per minute for this model (each allowed turn makes 3 chat calls)
+      tpm: 10000        # tokens per minute; the task's 500 is less than one review call (see PR note)
+      num_retries: 3
+
+  # Embeddings model. model_name is OPENAI_EMBEDDINGS_MODEL in the app's .env.
+  - model_name: text-embedding-ada-002
+    litellm_params:
+      model: openai/text-embedding-ada-002
+      api_base: os.environ/UPSTREAM_OPENAI_BASE_URL
+      api_key: os.environ/UPSTREAM_OPENAI_API_KEY
+      num_retries: 5
+    model_info:
+      mode: embedding   # model_info, not litellm_params: tells LiteLLM this is an embeddings model
+
+litellm_settings:
+  drop_params: true             # drop request parameters the provider doesn't support
+  max_budget: 5                 # proxy-wide budget in US dollars (not cents)
+  budget_duration: 1d           # max_budget resets every day
+  max_end_user_budget: 0.002    # US dollars per end user ("user" sent by the app)
+  request_timeout: 600          # seconds before a call times out
+  set_verbose: false            # no debug logging
+  json_logs: true               # logs in JSON format
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # admin key; also the admin UI password
+  # The salt key (LITELLM_SALT_KEY) and database URL (DATABASE_URL) are read from the
+  # environment directly: litellm/.env and docker-compose.yml.

@@ -1,0 +1,78 @@
+# LiteLLM proxy + Postgres for this project.
+# Based on litellm/deploy/compose/docker-compose.yml from https://github.com/BerriAI/litellm
+# Changes: image pinned to a release tag, build section removed, config.yaml mounted and
+# passed with --config, env_file points to litellm/.env (next to this file).
+#
+# Start (from this folder):  docker compose up -d
+# Postgres is not published on a host port, so it does not clash with Langfuse's Postgres on 5432.
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:v1.109.1  # pinned release tag, never main-stable/latest
+    ports:
+      - "4000:4000"
+    # Mount config.yaml (read-only) and tell the proxy to load it
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set it in litellm/.env}
+      LITELLM_MIGRATION_DIR: /tmp/litellm-migrations
+      DATABASE_URL: postgresql://llmproxy:dbpassword9090@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+    env_file:
+      - path: .env
+        required: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+      - /app/.cache:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: dbpassword9090
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus
+    profiles:
+      - monitoring
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    restart: always
+
+volumes:
+  prometheus_data:
+  postgres_data:
+    name: litellm_postgres_data

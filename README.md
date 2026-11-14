@@ -67,6 +67,18 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
    # Edit .env with your API keys and configuration
    ```
 
+### Running the LiteLLM proxy
+
+The app sends its LLM and embedding calls through a LiteLLM proxy at `http://localhost:4000`.
+
+```bash
+cd litellm
+cp .env.sample .env   # then fill in the values
+docker compose up -d
+```
+
+In the app's `.env`, set `OPENAI_BASE_URL=http://localhost:4000` and `OPENAI_API_KEY` to a LiteLLM virtual key.
+
 ### Running the Application
 
 ```bash
@@ -152,6 +164,10 @@ Here are the main directories and files in this repo:
 │   └── prompts.yml       # prompt for the self check input rail
 ├── datasets/
 │   └── smartphones.json
+├── litellm/
+│   ├── .env.sample          # template for litellm/.env (master key, salt key, real provider key)
+│   ├── config.yaml          # LiteLLM proxy models, rate limits and budgets
+│   └── docker-compose.yml   # LiteLLM proxy + Postgres, image pinned to a release tag
 ├── scripts/
 │   └── create_langfuse_prompts.py   # one-time upload of the app's prompts to Langfuse
 ├── tasks/

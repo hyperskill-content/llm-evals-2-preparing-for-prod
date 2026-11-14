@@ -29,10 +29,14 @@ users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
 # Initialize the LLM with OpenAI API credentials (substitute for other models)
+# With the LiteLLM proxy: OPENAI_BASE_URL is the proxy (http://localhost:4000) and
+# OPENAI_API_KEY is a LiteLLM virtual key, not the provider's key.
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL"),
     base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    api_key=os.getenv("OPENAI_API_KEY"),
+    # Sent as "user" in every request, so LiteLLM tracks spend and applies budgets per end user
+    model_kwargs={"user": user_id}
 )
 
 # Initialize the embeddings model with OpenAI API credentials
