@@ -1,0 +1,20 @@
+# NeMo Guardrails configuration for the smartphone info bot.
+#
+# The model is not set here. main.py passes in a ChatOpenAI built from the
+# same .env settings as the rest of the app (OPENAI_MODEL, OPENAI_BASE_URL,
+# OPENAI_API_KEY), so guardrails always use the configured model and endpoint.
+
+rails:
+  input:
+    flows:
+      # Ask the model whether the user's message breaks the guidelines in
+      # prompts.yml. If it does, the bot refuses and no other chain runs.
+      - self check input
+
+instructions:
+  - type: general
+    content: |
+      You verify inputs for a bot called the Smartphones info Bot.
+      The bot is designed to answer questions about smartphones such as comparisons and recommendations.
+      The bot can access smartphone details using context, but must be given the exact phone model.
+      If the bot is asked customer support queries like ordering, returns, tracking, etc, the bot replies it cannot help with such requests.
