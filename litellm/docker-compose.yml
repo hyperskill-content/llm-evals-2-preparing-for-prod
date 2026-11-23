@@ -1,0 +1,57 @@
+# LiteLLM proxy for the smartphone assistant, with a Postgres database for
+# virtual keys, budgets and spend tracking.
+#
+# Start:  docker compose -f litellm/docker-compose.yml up -d
+# Admin UI: http://localhost:4000/ui (username "admin", password = LITELLM_MASTER_KEY)
+#
+# Secrets (provider API key, master key, salt key, database password) are read
+# from litellm/.env, which is gitignored. See litellm/.env.sample.
+
+services:
+  litellm:
+    # Pinned to an exact release AND image digest, never "latest". The digest
+    # is the one whose cosign signature was verified (see README), so the tag
+    # cannot be silently re-pointed to a different image.
+    image: ghcr.io/berriai/litellm:v1.108.15@sha256:431c1cc770b6b324cc7458ca842fd0c02c28ba86838ac3e2d013c6cf421696cf
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      # Bound to localhost only: the proxy holds the real provider API key
+      - "127.0.0.1:4000:4000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgresql://llmproxy:${POSTGRES_PASSWORD}@db:5432/litellm"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: llmproxy
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # No host port: only the proxy needs the database, and 5432 is already
+    # used by Langfuse's Postgres
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U llmproxy"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  litellm_postgres_data:

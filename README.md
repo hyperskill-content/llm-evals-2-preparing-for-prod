@@ -69,9 +69,61 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
 
 ### Running the Application
 
+Chat history is stored in Redis. Start a Redis container on port 6380 (port 6379 is used by Langfuse's own Redis) and set `REDIS_URL=redis://localhost:6380/0` in `.env`:
+
+```bash
+docker run --restart always --name hyper-redis -d -p 6380:6379 redis redis-server --save 60 1
+```
+
+All model calls go through a LiteLLM proxy, which holds the real provider API key and enforces budgets and rate limits. The app only uses a virtual key. Set up the proxy once:
+
+```bash
+# 1. Secrets for the proxy (provider key, master key, salt key, database password)
+cp litellm/.env.sample litellm/.env   # then fill in the values
+
+# 2. Optional but recommended: verify the pinned image's signature
+cosign verify \
+  --certificate-identity https://github.com/BerriAI/project-releaser/.github/workflows/release.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/berriai/litellm:v1.108.15
+
+# 3. Start the proxy (http://localhost:4000, admin UI at /ui)
+docker compose -f litellm/docker-compose.yml up -d
+
+# 4. Create the HyperBudget tier, register the demo users on it, and write
+#    the app's virtual key and proxy settings to .env
+uv run python scripts/setup_litellm.py
+```
+
+The image is pinned to `v1.108.15` and its digest in `litellm/docker-compose.yml`. Before changing it, check the [release notes](https://docs.litellm.ai/release_notes) and [security advisories](https://github.com/BerriAI/litellm/security/advisories), and verify the new image's signature.
+
+Each request is sent with the current user as the OpenAI `user` field, so LiteLLM tracks spend per user and applies their budget. When a budget or rate limit is hit, the app tells the user and keeps the session open.
+
+The prompts are stored in Langfuse prompt management, so create them in your Langfuse project once before the first run (each rerun adds a new version and moves the `production` label to it):
+
+```bash
+uv run python scripts/create_langfuse_prompts.py
+```
+
+Then start the chatbot:
+
 ```bash
 uv run python main.py
 ```
+
+Run the tests (they need no API keys; the Redis tests are skipped if Redis is not running):
+
+```bash
+uv run pytest
+```
+
+The LiteLLM proxy tests are skipped if the proxy is not running. Also run the live guardrail tests, which send a few example messages to the model through the proxy:
+
+```bash
+RUN_LIVE_TESTS=1 uv run pytest tests/test_input_guardrails.py
+```
+
+User input is checked by NeMo Guardrails (`config/config.yml`, `config/prompts.yml`) before any chain runs. Blocked messages get a refusal, are not saved to chat history, and appear in Langfuse as `user-query` traces with level `WARNING`.
 
 If your IDE (VS Code, PyCharm) isn't recognizing the environment or you need to use tools that aren't uv-aware, activate the virtual environment manually:
 ```bash
@@ -147,8 +199,23 @@ Here are the main directories and files in this repo:
 │       ├── prompt_metrics.png
 │       ├── prompt_observations.png
 │       └── prompts_playground.png
+├── config/
+│   ├── config.yml                   # NeMo Guardrails: input rail and instructions
+│   └── prompts.yml                  # self check input prompt
 ├── datasets/
 │   └── smartphones.json
+├── litellm/
+│   ├── .env.sample                  # proxy secrets template (litellm/.env is gitignored)
+│   ├── config.yaml                  # models, budgets and rate limits
+│   └── docker-compose.yml           # pinned LiteLLM proxy + Postgres
+├── scripts/
+│   ├── create_langfuse_prompts.py   # uploads the chatbot prompts to Langfuse
+│   └── setup_litellm.py             # budget tier, customers and virtual key
+├── tests/
+│   ├── test_chat_history.py         # tests for Redis history and trimming
+│   ├── test_input_guardrails.py     # guardrail tests (live ones opt-in)
+│   ├── test_llm_clients.py          # proxy client, spend and error tests
+│   └── test_prompts.py              # offline tests for prompt loading
 ├── tasks/
 │   ├── task_1.md
 │   ├── task_2.md
@@ -156,7 +223,11 @@ Here are the main directories and files in this repo:
 │   └── task_4.md
 ├── .env.sample
 ├── .gitignore
+├── chat_history.py                  # Redis chat history, TTL and trimming
+├── input_guardrails.py              # checks user input with NeMo Guardrails
+├── llm_clients.py                   # chat/embeddings clients via the LiteLLM proxy
 ├── main.py
+├── prompts.py                       # loads versioned prompts from Langfuse
 ├── pyproject.toml
 ├── README.md
 └── uv.lock
