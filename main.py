@@ -6,15 +6,19 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
+from langchain_redis import RedisChatMessageHistory
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions, GenerationResponse
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -38,9 +42,6 @@ embeddings_model = OpenAIEmbeddings(
     api_key=os.getenv("OPENAI_API_KEY"),
     show_progress_bar=True
 )
-
-# Initialize conversation history
-conversation = []
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -165,13 +166,13 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> None:
+def generate_context(ai_message: AIMessage, conversation: list[BaseMessage]) -> None:
     """
     Process tool calls from the language model and append the AI message and
     each tool's response as ToolMessage objects to the conversation history.
 
-    :param
-        ai_message (AIMessage): The language model's output message containing tool_calls.
+    :param ai_message: The language model's output message containing tool_calls.
+    :param conversation: The current conversation's in-memory messages.
     """
     # construct the conversation history with the AI message containing tool calls
     conversation.append(ai_message)
@@ -199,6 +200,25 @@ def generate_context(ai_message: AIMessage) -> None:
                 content=f"An error occurred while processing tool calls: {e}"
             )
         )
+
+
+def get_blocked_input_message(result: GenerationResponse) -> str:
+    """Extract the message returned by the input rail when it blocks a request."""
+    output_data = result.output_data or {}
+    bot_message = output_data.get("bot_message")
+    if isinstance(bot_message, str) and bot_message.strip():
+        return bot_message
+
+    if isinstance(result.response, str) and result.response.strip():
+        return result.response
+
+    if isinstance(result.response, list):
+        for message in reversed(result.response):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+
+    raise RuntimeError("The input rail blocked a request without returning a message.")
 
 
 # ---------------------------
@@ -264,8 +284,16 @@ def main():
         goodbye_system_prompt
     )
 
-    context_chain = context_prompt | llm_with_tools | generate_context
-    review_chain = review_prompt | llm
+    trimmer = trim_messages(
+        strategy="last",
+        token_counter=llm,
+        max_tokens=500,
+        start_on="human",
+        end_on=("human", "tool"),
+        include_system=True,
+    )
+    context_chain = context_prompt | trimmer | llm_with_tools
+    review_chain = review_prompt | trimmer | llm
 
     goodbye_chain = goodbye_prompt | llm
 
@@ -273,6 +301,29 @@ def main():
     langfuse_handler = CallbackHandler()
 
     try:
+        redis_url = os.getenv("REDIS_URL") or os.getenv("REDIS_CONNECTION_STRING")
+        if not redis_url:
+            raise RuntimeError(
+                "Set REDIS_URL (or REDIS_CONNECTION_STRING) to your Redis connection URL."
+            )
+        redis_history = RedisChatMessageHistory(
+            session_id=session_id,
+            redis_url=redis_url,
+            ttl=3600,
+        )
+
+        guardrails_config = RailsConfig.from_path("config/")
+        guardrails_model = guardrails_config.models[0]
+        guardrails_model.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url:
+            guardrails_model.parameters["base_url"] = base_url
+        input_rails = RunnableRails(
+            guardrails_config,
+            input_key="user_input",
+            passthrough=False,
+        )
+
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
@@ -316,8 +367,6 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
-
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
                 as_type="span",
@@ -329,28 +378,64 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    # Context chain invocation
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "context",
-                            "callbacks": [langfuse_handler]
-                        }
+                    validation_result = input_rails.rails.generate(
+                        messages=[{"role": "user", "content": user_input}],
+                        options=GenerationOptions(
+                            rails=["input"],
+                            output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                        ),
                     )
 
-                    # Final response chain invocation
-                    response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "final-response",
-                            "callbacks": [langfuse_handler]
-                        }
+                    validation_context = validation_result.output_data or {}
+                    rail_triggered = (
+                        validation_context.get("allowed") is False
+                        or bool(validation_context.get("triggered_input_rail"))
                     )
 
-                # Set the output on the parent span
-                span.update(output={"response": response.content})
+                    if rail_triggered:
+                        blocked_message = get_blocked_input_message(validation_result)
+                        span.update(
+                            output={
+                                "blocked": True,
+                                "response": blocked_message,
+                                "triggered_input_rail": validation_context.get(
+                                    "triggered_input_rail"
+                                ),
+                            }
+                        )
+                    else:
+                        conversation = list(redis_history.messages)
+                        user_message = HumanMessage(user_input)
+                        conversation.append(user_message)
+
+                        # The rails call above receives only the current user message.
+                        # Conversation history is loaded only after the input is allowed.
+                        ai_with_tools = context_chain.invoke(
+                            {"user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "context",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
+                        generate_context(ai_with_tools, conversation)
+
+                        response = review_chain.invoke(
+                            {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "final-response",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
+
+                        span.update(output={"blocked": False, "response": response.content})
+
+            if rail_triggered:
+                print(f"System: {blocked_message}")
+                continue
 
             print(f"System: {response.content}")
+            redis_history.add_message(user_message)
+            redis_history.add_message(response)
             conversation.append(response)
 
     except Exception as e:
