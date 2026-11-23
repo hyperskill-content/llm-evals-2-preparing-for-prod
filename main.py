@@ -7,13 +7,16 @@ import uuid
 import dotenv
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_community.docstore.document import Document
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langfuse import get_client, observe, propagate_attributes
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -28,7 +31,7 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
 COLLECTION_NAME = "smartphones"
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
+# Initialize the LLM with OpenAI API credentials
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL"),
     base_url=os.getenv("OPENAI_BASE_URL"),
@@ -44,7 +47,7 @@ embeddings_model = OpenAIEmbeddings(
 )
 
 # Initialize Redis-backed conversation history (with 1-hour TTL)
-chat_history = RedisChatMessageHistory(
+redis_history = RedisChatMessageHistory(
     session_id=session_id,
     url=REDIS_URL,
     ttl=3600,
@@ -53,11 +56,14 @@ chat_history = RedisChatMessageHistory(
 # Initialize Langfuse client
 langfuse = get_client()
 
+# Load NeMo Guardrails configuration
+rails_config = RailsConfig.from_path("config/")
+input_rails = RunnableRails(rails_config, input_key="user_input")
+
 
 # ---------------------------
-# Load JSON Data and Connect to Qdrant Cloud Vector Store
+# Connect to Qdrant Cloud Vector Store
 # ---------------------------
-
 @observe(name="embed_documents")
 def embed_documents(json_path: str) -> QdrantVectorStore | list:
     """
@@ -135,29 +141,29 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> None:
+def generate_context(ai_message: AIMessage, conversation: list) -> None:
     """
     Process tool calls from the language model and append the AI message and
-    each tool's response to Redis conversation history.
+    each tool's response to the current turn's conversation list.
     """
-    chat_history.add_message(ai_message)
+    conversation.append(ai_message)
 
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        chat_history.add_message(
+        conversation.append(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
         )
+        return
 
     try:
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                chat_history.add_message(tool_output)
-
+                conversation.append(tool_output)
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        chat_history.add_message(
+        conversation.append(
             AIMessage(
                 content=f"An error occurred while processing tool calls: {e}"
             )
@@ -194,7 +200,7 @@ def main():
         goodbye_langfuse_prompt.get_langchain_prompt()[0][1]
     )
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | llm_with_tools
     review_chain = review_prompt | llm
     goodbye_chain = goodbye_prompt | llm
 
@@ -204,6 +210,9 @@ def main():
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
+            if not user_input:
+                continue
+
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 with langfuse.start_as_current_observation(
                     as_type="span",
@@ -242,8 +251,6 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
-            chat_history.add_user_message(user_input)
-
             with langfuse.start_as_current_observation(
                 as_type="span",
                 name="user-query",
@@ -253,8 +260,39 @@ def main():
                     session_id=session_id,
                     user_id=user_id,
                 ):
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": chat_history.messages},
+                    # 1. Validate input with NeMo Guardrails BEFORE calling chains
+                    validation_result = input_rails.rails.generate(
+                        messages=[{"role": "user", "content": user_input}],
+                        options=GenerationOptions(
+                            rails=["input"],
+                            output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                        ),
+                    )
+
+                    validation_context = validation_result.output_data or {}
+                    rail_triggered = validation_context.get("allowed") is False or bool(
+                        validation_context.get("triggered_input_rail")
+                    )
+
+                    if rail_triggered:
+                        blocked_reply = validation_result.response[0]["content"]
+                        span.update(
+                            output={
+                                "response": blocked_reply,
+                                "rail_triggered": True,
+                                "triggered_input_rail": validation_context.get("triggered_input_rail"),
+                            }
+                        )
+                        print(f"System: {blocked_reply}")
+                        continue  # Skip LLM chains and skip saving to Redis
+
+                    # 2. Load clean history from Redis and process normal turn
+                    conversation = list(redis_history.messages)
+                    user_message = HumanMessage(user_input)
+                    conversation.append(user_message)
+
+                    ai_with_tools = context_chain.invoke(
+                        {"user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler],
@@ -262,8 +300,10 @@ def main():
                         },
                     )
 
+                    generate_context(ai_with_tools, conversation)
+
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": chat_history.messages},
+                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "final-response",
                             "callbacks": [langfuse_handler],
@@ -274,10 +314,14 @@ def main():
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
-            chat_history.add_ai_message(response.content)
+
+            # 3. Persist clean messages to Redis Cloud
+            redis_history.add_message(user_message)
+            redis_history.add_message(response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
+        traceback.print_exc()
         langfuse.flush()
         sys.exit(1)
 
