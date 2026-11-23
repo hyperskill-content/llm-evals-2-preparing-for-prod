@@ -6,8 +6,7 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_core.prompts import MessagesPlaceholder, ChatPromptTemplate, PromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -15,6 +14,15 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+
+from chat_history import build_trimmer, create_chat_history, save_turn
+from prompts import (
+    CONTEXT_PROMPT_NAME,
+    GOODBYE_PROMPT_NAME,
+    REVIEW_PROMPT_NAME,
+    load_chat_prompt,
+    load_text_prompt,
+)
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -39,8 +47,9 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# Initialize conversation history
-conversation = []
+# Redis connection for chat history. The default matches the task's Docker setup
+# (port 6380, because Langfuse's own Redis uses 6379).
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380/0")
 
 # Initialize Langfuse client
 langfuse = get_client()
@@ -165,13 +174,21 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> None:
+def generate_context(ai_message: AIMessage, conversation: list) -> list:
     """
     Process tool calls from the language model and append the AI message and
-    each tool's response as ToolMessage objects to the conversation history.
+    each tool's response as ToolMessage objects to the conversation.
+
+    The conversation is the in-memory message list for the current turn. It is
+    modified in place; these tool messages are not saved to Redis.
 
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
+        conversation (list): Messages for the current turn (history loaded from
+            Redis plus the user's new message).
+
+    :returns
+        list: The same conversation list, with the AI message and tool results appended.
     """
     # construct the conversation history with the AI message containing tool calls
     conversation.append(ai_message)
@@ -200,6 +217,8 @@ def generate_context(ai_message: AIMessage) -> None:
             )
         )
 
+    return conversation
+
 
 # ---------------------------
 # Main Conversation Loop
@@ -211,63 +230,27 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_system_prompt = """
-        You're part of a smartphone recommendation system. Your work is to use the SmartphoneInfo tool to retrieve information about smartphones based on user queries.
-          - If the user requests specs/comparisons/recommendations for a model explicitly mentioned in chat or can be inferred from the conversation history, call SmartphoneInfo(model)
-          - If multiple models are mentioned or from the conversation history, you must call SmartphoneInfo for each model separately.
-          - If the user asks a general question, do nothing.
-        Do not guess or recommend a model from internal knowledge; the model name must be clear from the chat history or user input.
+    # Load the prompts from Langfuse prompt management instead of hard-coding them.
+    # Each template carries its Langfuse prompt in metadata, so generations are
+    # linked to the prompt version that produced them. Create the prompts first
+    # with scripts/create_langfuse_prompts.py.
+    context_prompt = load_chat_prompt(langfuse, CONTEXT_PROMPT_NAME)
+    review_prompt = load_chat_prompt(langfuse, REVIEW_PROMPT_NAME)
+    goodbye_prompt = load_text_prompt(langfuse, GOODBYE_PROMPT_NAME)
 
-        Current question: {user_input}
-    """
-
-    review_system_prompt = """
-        You are an expert AI assistant helping customers pick the best smartphone from our catalog. Follow these rules strictly:
-
-        1. Focus solely on concise (under 100 words), human-like, personalized reviews/comparisons of models named in the user's query or provided context.
-        2. Think step by step before answering.
-        3. Never guess or recommend any model not explicitly mentioned in the context or query.
-        4. If no model is given, ask the user to check our online catalog for the exact model name.
-        5. DO NOT assist with ordering, returns, tracking, or other general support.
-        6. If asked about anything outside smartphone features/comparisons, respond that you can't help.
-        7. If the user only wants to chat, engage briefly, but always steer back to smartphone comparisons.
-        8. Never list smartphone specifications, but instead explain how they translate to real-world benefits.
-
-        When recommending, evaluate performance, display, battery, camera, and special functions (e.g., 5G, fast charging, expandable storage), and how they translate to real-world benefits.
-        Always confirm the user's needs before finalizing.
-
-        Current user: {user_id}
-        Current question: {user_input}
-    """
-
-    goodbye_system_prompt = """
-        You have been helping the user: {user_id} with smartphone features and comparisons.
-        Generate a short friendly goodbye message for the user and also thank them for their feedback.
-        (note that you've already been helping the user with smartphone features and comparisons, so do not repeat that or greet them again)
-    """
-
-    context_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(context_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
-
-    review_prompt = ChatPromptTemplate.from_messages(
-        [
-            (SystemMessage(review_system_prompt)),
-            MessagesPlaceholder(variable_name="conversation")
-        ]
-    )
-
-    goodbye_prompt = PromptTemplate.from_template(
-        goodbye_system_prompt
-    )
-
-    context_chain = context_prompt | llm_with_tools | generate_context
+    # The trimmer sits between the prompt and the model, so the context chain
+    # only sees the system message plus the most recent history that fits in
+    # the token budget (chat_history.CONTEXT_MAX_TOKENS). The LLM's tokenizer
+    # is used to count tokens.
+    trimmer = build_trimmer(token_counter=llm)
+    context_chain = context_prompt | trimmer | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
+
+    # Chat history for this session is stored in Redis and expires after
+    # chat_history.CHAT_HISTORY_TTL_SECONDS without new messages
+    redis_history = create_chat_history(session_id, REDIS_URL)
 
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
@@ -316,7 +299,12 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
-            conversation.append(HumanMessage(user_input))
+            # Build this turn's in-memory conversation: the saved history from
+            # Redis plus the user's new message. Tool calls and tool results are
+            # added to this list during the turn but never saved to Redis.
+            conversation = list(redis_history.messages)
+            user_message = HumanMessage(user_input)
+            conversation.append(user_message)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
@@ -329,14 +317,18 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    # Context chain invocation
-                    context_chain.invoke(
+                    # Context chain: decide which smartphones to look up
+                    tool_call_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
                         }
                     )
+
+                    # Run the requested tool calls and add their results to
+                    # this turn's conversation for the review chain to use
+                    generate_context(tool_call_message, conversation)
 
                     # Final response chain invocation
                     response = review_chain.invoke(
@@ -351,7 +343,9 @@ def main():
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
-            conversation.append(response)
+
+            # Persist only the user's message and the final reply to Redis
+            save_turn(redis_history, user_message, response)
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
