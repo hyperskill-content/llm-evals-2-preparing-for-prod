@@ -22,20 +22,44 @@ dotenv.load_dotenv()
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
 users = ["James", "George", "Mike", "Sherlock"]
-user_id = users[uuid.uuid4().int % len(users)]
+user_id = os.getenv("LITELLM_USER_ID") or users[uuid.uuid4().int % len(users)]
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+litellm_base_url = os.getenv("LITELLM_BASE_URL")
+litellm_api_key = os.getenv("LITELLM_KEY") or os.getenv("LITELLM_API_KEY")
+litellm_chat_model = os.getenv("LITELLM_MODEL") or os.getenv("OPENAI_MODEL")
+litellm_embeddings_model = (
+    os.getenv("LITELLM_EMBEDDINGS_MODEL") or os.getenv("OPENAI_EMBEDDINGS_MODEL")
 )
 
-# Initialize the embeddings model with OpenAI API credentials
+missing_litellm_settings = [
+    name
+    for name, value in (
+        ("LITELLM_BASE_URL", litellm_base_url),
+        ("LITELLM_KEY", litellm_api_key),
+        ("LITELLM_MODEL or OPENAI_MODEL", litellm_chat_model),
+        ("LITELLM_EMBEDDINGS_MODEL or OPENAI_EMBEDDINGS_MODEL", litellm_embeddings_model),
+    )
+    if not value
+]
+if missing_litellm_settings:
+    raise RuntimeError(
+        "Missing LiteLLM configuration: " + ", ".join(missing_litellm_settings)
+    )
+
+# Initialize the LLM through LiteLLM so virtual-key budgets and rate limits apply.
+llm = ChatOpenAI(
+    model=litellm_chat_model,
+    base_url=litellm_base_url,
+    api_key=litellm_api_key,
+    model_kwargs={"user": user_id},
+)
+
+# Route embedding requests through the same LiteLLM virtual key.
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=litellm_embeddings_model,
+    base_url=litellm_base_url,
+    api_key=litellm_api_key,
+    model_kwargs={"user": user_id},
     show_progress_bar=True
 )
 

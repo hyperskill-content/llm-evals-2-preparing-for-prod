@@ -1,0 +1,31 @@
+model_list:
+  - model_name: smartphone-chat
+    litellm_params:
+      model: os.environ/UPSTREAM_CHAT_MODEL
+      api_base: os.environ/UPSTREAM_BASE_URL
+      api_key: os.environ/UPSTREAM_API_KEY
+      rpm: 10
+      tpm: 500
+      num_retries: 3
+
+  - model_name: smartphone-embeddings
+    litellm_params:
+      model: os.environ/UPSTREAM_EMBEDDINGS_MODEL
+      api_base: os.environ/UPSTREAM_BASE_URL
+      api_key: os.environ/UPSTREAM_API_KEY
+      num_retries: 3
+      mode: embedding
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+  set_verbose: false
+  json_logs: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  salt_key: os.environ/LITELLM_SALT_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL
+  max_budget: 5
+  max_end_user_budget: 0.002
+  budget_duration: 1d
