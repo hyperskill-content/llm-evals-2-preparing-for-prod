@@ -67,6 +67,35 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
    # Edit .env with your API keys and configuration
    ```
 
+### LiteLLM Proxy
+
+The application sends chat and embedding requests through LiteLLM. A local proxy and PostgreSQL setup is provided under `litellm/`.
+
+1. Configure the proxy's upstream provider and unique secrets:
+
+   ```bash
+   cd litellm
+   cp .env.example .env
+   # Edit .env; use strong, unique values for the master key, salt, and database password.
+   docker compose up -d
+   ```
+
+   The proxy image is pinned to LiteLLM `v1.85.0`. The sample config registers `smartphone-chat` and `smartphone-embeddings`, sets per-deployment rate limits, and configures global and end-user budgets. Check the proxy using the Admin UI or its `/v1/models` endpoint. Do not commit the populated `litellm/.env` file.
+
+2. In the LiteLLM Admin UI, create a virtual key with access to both models. Configure any user-specific budget or rate limits there. If creating a LiteLLM customer for the end user, use the same ID in `LITELLM_USER_ID`.
+
+3. Configure the app's environment:
+
+```dotenv
+LITELLM_BASE_URL=http://localhost:4000
+LITELLM_KEY=<your_litellm_virtual_key>
+LITELLM_MODEL=smartphone-chat
+LITELLM_EMBEDDINGS_MODEL=smartphone-embeddings
+LITELLM_USER_ID=<stable_litellm_customer_id>
+```
+
+The app sends `user_id` with chat and embedding requests so LiteLLM can track usage and apply configured end-user budgets. `LITELLM_USER_ID` should be stable across runs; if omitted, the demo selects one of its sample user names. `LITELLM_MODEL` and `LITELLM_EMBEDDINGS_MODEL` can be omitted when the proxy model names match `OPENAI_MODEL` and `OPENAI_EMBEDDINGS_MODEL`. The app does not create virtual keys or budgets; manage these in LiteLLM. See [Task 4](./tasks/task_4.md) for more proxy configuration details.
+
 ### Running the Application
 
 ```bash

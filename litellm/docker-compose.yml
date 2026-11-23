@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:17.5-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in litellm/.env}
+    volumes:
+      - litellm_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d litellm -U litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.85.0
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Set LITELLM_MASTER_KEY in litellm/.env}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?Set LITELLM_SALT_KEY in litellm/.env}
+      LITELLM_DATABASE_URL: postgresql://litellm:${POSTGRES_PASSWORD}@db:5432/litellm
+      UPSTREAM_CHAT_MODEL: ${UPSTREAM_CHAT_MODEL:?Set UPSTREAM_CHAT_MODEL in litellm/.env}
+      UPSTREAM_EMBEDDINGS_MODEL: ${UPSTREAM_EMBEDDINGS_MODEL:?Set UPSTREAM_EMBEDDINGS_MODEL in litellm/.env}
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL:?Set UPSTREAM_BASE_URL in litellm/.env}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:?Set UPSTREAM_API_KEY in litellm/.env}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+
+volumes:
+  litellm_db:
