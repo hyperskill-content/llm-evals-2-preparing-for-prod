@@ -25,24 +25,32 @@ dotenv.load_dotenv()
 session_id = f"session-{uuid.uuid4().hex[:8]}"
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
+litellm_user = os.getenv("LITELLM_USER") or user_id
+litellm_api_key = (
+    os.getenv("LITELLM_API_KEY")
+    or os.getenv("LLMLITE_API_KEY")
+    or os.getenv("LLMLITE")
+    or os.getenv("OPENAI_API_KEY")
+)
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
 COLLECTION_NAME = "smartphones"
 
-# Initialize the LLM with OpenAI API credentials
+# Initialize the LLM through LiteLLM Proxy
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_MODEL") or os.getenv("OPENAI_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+    api_key=litellm_api_key,
+    model_kwargs={"user": litellm_user},
 )
 
-# Initialize the embeddings model with OpenAI API credentials
+# Initialize the embeddings model through LiteLLM Proxy
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=os.getenv("LITELLM_EMBEDDINGS_MODEL") or os.getenv("OPENAI_EMBEDDINGS_MODEL"),
+    base_url=os.getenv("LITELLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"),
+    api_key=litellm_api_key,
     show_progress_bar=False,
 )
 
@@ -327,4 +335,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
